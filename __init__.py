@@ -11,6 +11,10 @@ the entrypoint, where someone reordering imports would otherwise not see it.
 """
 
 from .subagents import litellm_patch  # noqa: F401  (side effect: rate limiting)
-from .orchestrator_agent import root_agent  # noqa: E402  (must follow the patch)
+from .orchestrator_agent import app, root_agent  # noqa: E402  (must follow the patch)
 
-__all__ = ["root_agent", "litellm_patch"]
+# `app` must be exported, not just defined. ADK's agent loader checks the
+# PACKAGE for an `app` attribute first and only falls back to `root_agent` —
+# so exporting `root_agent` alone would load the bare agent and silently
+# discard the App, taking the events-compaction config with it.
+__all__ = ["app", "root_agent", "litellm_patch"]

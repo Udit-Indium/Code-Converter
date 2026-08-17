@@ -1,4 +1,6 @@
 from google.adk.agents import SequentialAgent
+from google.adk.apps import App
+from google.adk.apps.app import EventsCompactionConfig
 
 from .subagents.script_refactor import script_refactor_loop_agent
 from .subagents.code_parser import code_parser_agent
@@ -25,4 +27,13 @@ root_agent = SequentialAgent(
         test_correction_loop_agent,
         semantic_validation_loop_agent,
     ],
+)
+events_compaction_config = EventsCompactionConfig(
+    compaction_interval=10,
+    overlap_size=2,
+)
+app = App(
+    name="code_converter_flow",
+    root_agent=root_agent,
+    events_compaction_config=events_compaction_config,
 )
