@@ -12,7 +12,6 @@ from google.adk.tools.skill_toolset import SkillToolset
 from google.adk.agents import Agent
 from google.adk.agents.callback_context import CallbackContext
 from google.adk.models.lite_llm import LiteLlm
-from ...rate_limit import rate_limited_lite_llm
 from google.adk.tools.tool_context import ToolContext
 from dotenv import load_dotenv
 
@@ -856,7 +855,7 @@ my_skill_toolset = SkillToolset(
 
 code_convertor_agent = Agent(
     name="agent_code_converter",
-    model = rate_limited_lite_llm(
+    model = LiteLlm(
         model=f"databricks/{CONVERTER_MODEL}",
     ),
     instruction= """You are an expert coder who converts a Python ELT script into equivalent,
@@ -963,7 +962,7 @@ code_convertor_agent = Agent(
 
 code_fixer_agent = Agent(
     name="code_fixer_agent",
-    model = rate_limited_lite_llm(
+    model = LiteLlm(
         model=f"databricks/{CODE_FIXER_MODEL}",
     ),
     instruction= """You are an expert PySpark engineer. A converted PySpark pipeline
@@ -1041,7 +1040,7 @@ code_fixer_agent = Agent(
 
 semantic_code_fixer_agent = Agent(
     name="semantic_code_fixer_agent",
-    model = rate_limited_lite_llm(
+    model = LiteLlm(
         model=f"databricks/{SEMANTIC_FIXER_MODEL}",
     ),
     instruction= """You are an expert PySpark engineer. A converted PySpark pipeline
