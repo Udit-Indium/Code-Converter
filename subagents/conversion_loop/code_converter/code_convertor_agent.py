@@ -644,13 +644,21 @@ def _compact_case_fact_status(state) -> dict:
         name for name in _source_function_names()
         if name not in converted_names
     ]
-    mismatch = existing.get("constant_value_mismatch") or []
+    # `constant_mismatch_sample` is the key the case-fact checker actually
+    # writes. Reading the pre-trim name (`constant_value_mismatch`) yielded an
+    # empty list on every turn, so the converter was told the constants were
+    # fine no matter how many the checker had flagged — and constants are the
+    # one thing the loop cannot discover for itself, because the checker
+    # escalates only when they all match.
+    mismatch = existing.get("constant_mismatch_sample") or []
+    mismatch_count = existing.get("constant_value_mismatch_count", len(mismatch))
     return {
         "status": existing.get("status", "error"),
         "function_missing_count": len(missing),
         "function_missing_sample": missing[:20],
         "constant_value_mismatch": mismatch[:20],
-        "constant_value_mismatch_truncated": len(mismatch) > 20,
+        "constant_value_mismatch_count": mismatch_count,
+        "constant_value_mismatch_truncated": mismatch_count > len(mismatch[:20]),
         "message": (
             "Convert the next batch of functions. The authoritative work-list "
             "is derived from the source and converted files on disk."
