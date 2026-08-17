@@ -626,81 +626,6 @@ def _is_stream(response: Any) -> bool:
     return hasattr(response, "__aiter__") or hasattr(response, "__anext__")
 
 
-class _SettlingAsyncStream:
-    """Defers a reservation's settlement until the stream is finished.
-
-    Without this, a streamed response settles the instant the iterator is handed
-    back — before a single token exists — so `settle` sees no usage, keeps the
-    pessimistic reservation, and the entire `max_tokens` ceiling stays charged
-    for the full refill period. Over a run of streamed turns that is a large
-    block of budget the pipeline never actually spent, and the limiter paces
-    against it as if it had.
-
-    Settlement happens on exhaustion, on explicit close, and as a last resort on
-    garbage collection — a consumer that abandons a stream midway must not strand
-    the budget.
-    """
-
-    def __init__(self, inner: Any, reservation: Reservation, model: str) -> None:
-        self._inner = inner
-        self._reservation = reservation
-        self._model = model
-        self._iterator: Any = None
-        self._last_chunk: Any = None
-
-    def __aiter__(self) -> "_SettlingAsyncStream":
-        self._iterator = self._inner.__aiter__()
-        return self
-
-    async def __anext__(self) -> Any:
-        try:
-            chunk = await self._iterator.__anext__()
-        except StopAsyncIteration:
-            self._settle()
-            raise
-        except BaseException:
-            self._settle()
-            raise
-        self._last_chunk = chunk
-        return chunk
-
-    def _settle(self) -> None:
-        """Reconcile from the final chunk's usage, if the stream carried one.
-
-        LiteLLM only emits usage on the last chunk when the caller asked for it
-        (`stream_options={"include_usage": True}`); absent that, this releases
-        the ceiling rather than holding budget for output that has already been
-        produced and counted by the server.
-        """
-        if self._reservation._settled:
-            return
-        usage = _response_usage(self._last_chunk)
-        if usage is not None:
-            released = self._reservation.settle(usage)
-        else:
-            released = self._reservation.output_charged or self._reservation.max_tokens
-            self._reservation._settled = True
-            self._reservation.limiter.output_tokens.release(released)
-        logger.debug(
-            "RateLimiter | %s | stream finished, released=%d", self._model, released
-        )
-
-    async def aclose(self) -> None:
-        self._settle()
-        closer = getattr(self._inner, "aclose", None)
-        if closer is not None:
-            await closer()
-
-    def __del__(self) -> None:
-        # Backstop for a consumer that walks away mid-stream.
-        try:
-            self._settle()
-        except Exception:  # noqa: BLE001 - never raise from __del__
-            pass
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._inner, name)
-
 
 async def acall_with_rate_limit(
     acomplete: Callable[..., Awaitable[Any]],
@@ -748,10 +673,22 @@ async def acall_with_rate_limit(
             continue
 
         if _is_stream(response):
-            # No tokens exist yet — settling now would keep the whole ceiling
-            # charged for the full refill period. Hand back a proxy that settles
-            # when the stream actually finishes.
-            return _SettlingAsyncStream(response, reservation, model)
+            # Streamed: the tokens do not exist yet, so there is nothing to
+            # reconcile against. Keep the pessimistic reservation and return
+            # litellm's own object UNTOUCHED.
+            #
+            # An earlier version returned a settling proxy here so the unused
+            # ceiling could be refunded when the stream finished. That proxy is
+            # not a litellm `CustomStreamWrapper`, and ADK feeds this value
+            # straight into its Pydantic-typed response path — a foreign object
+            # there fails serialization. Over-reserving costs throughput;
+            # substituting the type breaks the caller, so the reservation stands.
+            logger.debug(
+                "RateLimiter | %s | streamed response: holding the full %d-token "
+                "output reservation (no usage to reconcile against)",
+                model, reservation.output_charged or reservation.max_tokens,
+            )
+            return response
 
         _log_settlement(model, reservation, reservation.settle(_response_usage(response)))
         return response
