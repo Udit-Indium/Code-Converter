@@ -9,9 +9,6 @@ from google.adk.models.lite_llm import LiteLlm
 from dotenv import load_dotenv
 
 from .tools import run_parser
-
-
-from ...model_config import CASE_FACT_MODEL
 load_dotenv()
 
 #: Where the code parser leaves the AST inventory. A fixed name, so nothing has
@@ -243,7 +240,7 @@ def check_fact_status(callback_context: CallbackContext) -> None:
 case_fact_checker_agent = Agent(
     name="case_fact_checker_agent",
     model = LiteLlm(
-        model=f"databricks/{CASE_FACT_MODEL}",
+        model="databricks/databricks-claude-opus-4-7",
     ),
     instruction= """You are an expert case fact checker who checks the code and make sure that the coonverted python code
     has same number of functions, classes and has same constant values as source python script has.

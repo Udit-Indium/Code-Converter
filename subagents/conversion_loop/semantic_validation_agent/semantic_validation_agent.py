@@ -17,9 +17,6 @@ from google.adk.tools.tool_context import ToolContext
 from dotenv import load_dotenv
 
 from ..code_converter import semantic_code_fixer_agent
-
-
-from ...model_config import SEMANTIC_MODEL
 load_dotenv()
 
 OUTPUTS_DIR = pathlib.Path(__file__).parents[3] / "outputs"
@@ -698,7 +695,7 @@ def compare_outputs_tool(context: ToolContext) -> dict:
 semantic_validation_agent = Agent(
     name="semantic_validation_agent",
     model=LiteLlm(
-        model=f"databricks/{SEMANTIC_MODEL}",
+        model="databricks/databricks-claude-sonnet-4-6",
     ),
     instruction="""You verify that the converted PySpark pipeline is SEMANTICALLY
     equivalent to the source Python pipeline by running the SAME data through both

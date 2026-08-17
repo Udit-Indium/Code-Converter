@@ -78,9 +78,8 @@ def _make_namer(args: argparse.Namespace) -> LLMFunctionNamer | None:
     model = args.model
     if not model:
         # Imported lazily so the CLI works standalone, outside the agent repo.
-        from ..model_config import REFACTOR_MODEL
 
-        model = f"databricks/{REFACTOR_MODEL}"
+        model = "databricks/databricks-claude-opus-4-7"
     return LLMFunctionNamer(model=model)
 
 

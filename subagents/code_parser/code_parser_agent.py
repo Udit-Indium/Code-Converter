@@ -9,7 +9,6 @@ from google.adk.tools.tool_context import ToolContext
 from google.adk import Agent
 from dotenv import load_dotenv
 from .scripts.ast_parser import run_parser
-from ..model_config import CODE_PARSER_MODEL
 load_dotenv()
 
 def _safe_stem(name: str) -> str:
@@ -387,7 +386,7 @@ def ast_parser(context: ToolContext, script_path: str)-> dict[str, str]:
 
 code_parser_agent = Agent(
     model = LiteLlm(
-        model=f"databricks/{CODE_PARSER_MODEL}",
+        model=f"databricks/databricks-claude-opus-4-7",
     ),
     name="code_parser_agent",
     instruction="""

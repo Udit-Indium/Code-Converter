@@ -14,8 +14,6 @@ from google.adk.agents.callback_context import CallbackContext
 from google.adk.models.lite_llm import LiteLlm
 from google.adk.tools.tool_context import ToolContext
 from dotenv import load_dotenv
-
-from ...model_config import CODE_FIXER_MODEL, CONVERTER_MODEL, SEMANTIC_FIXER_MODEL
 load_dotenv()
 
 
@@ -856,7 +854,7 @@ my_skill_toolset = SkillToolset(
 code_convertor_agent = Agent(
     name="agent_code_converter",
     model = LiteLlm(
-        model=f"databricks/{CONVERTER_MODEL}",
+        model="databricks/databricks-claude-sonnet-4-6",
     ),
     instruction= """You are an expert coder who converts a Python ELT script into equivalent,
     distributed **PySpark** code. The output file is built up INCREMENTALLY across several
@@ -963,7 +961,7 @@ code_convertor_agent = Agent(
 code_fixer_agent = Agent(
     name="code_fixer_agent",
     model = LiteLlm(
-        model=f"databricks/{CODE_FIXER_MODEL}",
+        model="databricks/databricks-claude-opus-4-7",
     ),
     instruction= """You are an expert PySpark engineer. A converted PySpark pipeline
     already exists on disk (it may contain dozens of functions), but its pytest parity
@@ -1041,7 +1039,7 @@ code_fixer_agent = Agent(
 semantic_code_fixer_agent = Agent(
     name="semantic_code_fixer_agent",
     model = LiteLlm(
-        model=f"databricks/{SEMANTIC_FIXER_MODEL}",
+        model="databricks/databricks-claude-sonnet-4-6",
     ),
     instruction= """You are an expert PySpark engineer. A converted PySpark pipeline
     exists on disk (possibly dozens of functions), but when the SAME data is run through

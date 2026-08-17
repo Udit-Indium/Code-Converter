@@ -6,7 +6,6 @@ from google.adk import Agent
 from google.adk.models.lite_llm import LiteLlm
 from google.adk.tools.tool_context import ToolContext
 from ..code_parser.code_parser_agent import notebook_to_python
-from ..model_config import REFACTOR_MODEL
 from .blocking import BlockingConfig
 from .naming import LLMFunctionNamer
 from .refactor import RefactorConfig, refactor_file
@@ -61,7 +60,7 @@ def refactor_script(
     destination = OUTPUT_DIR / f"{source_path.stem}_refactored.py"
 
     namer = (
-        LLMFunctionNamer(model=f"databricks/{REFACTOR_MODEL}")
+        LLMFunctionNamer(model="databricks/databricks-claude-opus-4-7")
         if use_llm_names
         else None
     )
@@ -104,7 +103,7 @@ def refactor_script(
 
 
 script_refactor_agent = Agent(
-    model=LiteLlm(model=f"databricks/{REFACTOR_MODEL}"),
+    model=LiteLlm(model="databricks/databricks-claude-opus-4-7"),
     name="script_refactor_agent",
     instruction="""
     You restructure a flat Python script into modular functions before it is

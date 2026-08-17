@@ -12,9 +12,6 @@ from google.adk.models.lite_llm import LiteLlm
 from google.adk.tools.tool_context import ToolContext
 from dotenv import load_dotenv
 from .tools import run_parser
-
-
-from ...model_config import PARITY_MODEL
 load_dotenv()
 
 OUTPUTS_DIR = pathlib.Path(__file__).parents[3] / "outputs"
@@ -680,7 +677,7 @@ def run_pytest_tool(context: ToolContext) -> dict:
 parity_test_case_validation_agent = Agent(
     name="parity_test_case_validation_agent",
     model=LiteLlm(
-        model=f"databricks/{PARITY_MODEL}",
+        model="databricks/databricks-claude-opus-4-7",
     ),
     instruction="""You are an expert PySpark test engineer. You write pytest-based
     parity test cases for a converted PySpark pipeline. There is ONE non-negotiable
