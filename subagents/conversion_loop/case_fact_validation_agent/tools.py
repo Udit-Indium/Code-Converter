@@ -14,8 +14,8 @@ from typing import Any
 # ---------------------------------------------------------------------------
 # Mirror of scripts/ast_parser.py (the pandas parser) but taught the PySpark
 # DataFrame API instead of pandas.  It produces the EXACT SAME JSON schema so
-# the parity-test validation agent can diff a parsed original-Python pipeline
-# against a parsed converted-PySpark pipeline field-by-field.
+# the case-fact checker can diff a parsed original-Python pipeline against a
+# parsed converted-PySpark pipeline field-by-field.
 #
 # Output schema (per module):
 #   metadata, imports, constants, classes, functions, call_graph, summary,

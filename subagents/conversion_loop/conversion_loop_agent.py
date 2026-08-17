@@ -16,13 +16,13 @@ conversion_loop_agent = LoopAgent(
     # functions — fewer when a batch does not fit in its output limit.
     #
     # The previous comment assumed ~20 per iteration and set this to 8, which
-    # capped the loop at 64 functions. A notebook restructured by the refactor
-    # stage routinely exceeds that (the current source is 69), and the shortfall
-    # is silent: the loop simply exhausts its iterations with functions still
-    # unconverted, and the parity stage then tests an incomplete module.
+    # capped the loop at 64 functions. The shortfall is silent: the loop simply
+    # exhausts its iterations with functions still unconverted, and semantic
+    # validation then runs against an incomplete module.
     #
-    # 16 covers ~128 functions, or ~9 batches plus fix passes for the current
-    # source. If your source is much larger, raise this or BATCH_SIZE.
+    # 16 covers ~128 functions, comfortably clear of the ~19 the refactor now
+    # produces for the current source. If your source is much larger, raise
+    # this or BATCH_SIZE.
     max_iterations=16,
 )
 

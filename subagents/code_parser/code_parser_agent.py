@@ -9,6 +9,7 @@ from google.adk.tools.tool_context import ToolContext
 from google.adk import Agent
 from dotenv import load_dotenv
 from .scripts.ast_parser import run_parser
+from ..script_refactor import RefactorConfig, refactor_file
 load_dotenv()
 
 def _safe_stem(name: str) -> str:
@@ -174,8 +175,11 @@ def notebook_to_python(context: ToolContext, script_path: str) -> dict[str, str]
         text = "\n".join(rows) + "\n"
         parses, parse_error, error_context, bad_line = _parse_report(text)
 
-    # Rewrite only when the content actually differs, so a re-run does not
-    # churn the file's mtime for output that has not changed.
+    # Rewrite only when the content actually differs. This is what makes the
+    # refactored file's staleness check meaningful downstream: this function
+    # runs again on every pipeline pass, and an unconditional write would bump
+    # the flat script's mtime past the refactored script derived from it,
+    # making a perfectly current refactor look stale on every single run.
     unchanged = False
     try:
         unchanged = out_path.is_file() and out_path.read_text(encoding="utf-8") == text
@@ -237,6 +241,60 @@ OUTPUT_DIR = Path(__file__).parent.parent.parent / "outputs"
 #: input filename so a consumer needs no knowledge of what was parsed.
 AST_INVENTORY = OUTPUT_DIR / "ast_inventory.json"
 
+#: Suffix appended to the script that gets restructured into functions.
+_REFACTORED_SUFFIX = "_refactored"
+
+
+def _refactor_if_flat(script_path: Path) -> tuple[Path, str]:
+    """Restructure `script_path` into functions, returning what to parse.
+
+    Called inline rather than run as its own pipeline stage, because
+    `script_refactor` is a deterministic AST library with no agent and no model
+    call — there is nothing for a stage to decide. Doing it here also removes
+    the handoff that used to go wrong: the refactored path was passed through
+    agent state, and `notebook_to_python` rewrites its own state key on every
+    run, so a later stage could silently overwrite it and undo the refactor.
+
+    A flat notebook-derived script has almost no top-level functions, and the
+    converter works function by function, so parsing the flat version would
+    hand the converter a nearly empty inventory and no explanation.
+
+    Failure is non-fatal: the flat script is returned with a note. A partial
+    pipeline that says why it is degraded beats one that stops.
+
+    Returns:
+        `(path_to_parse, note)`. `note` is non-empty only when something needs
+        saying — a refactor that failed, or was skipped.
+    """
+    # Already refactored: do not produce `..._refactored_refactored`.
+    if script_path.stem.endswith(_REFACTORED_SUFFIX):
+        return script_path, ""
+
+    destination = OUTPUT_DIR / f"{script_path.stem}{_REFACTORED_SUFFIX}.py"
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    try:
+        result = refactor_file(
+            script_path,
+            destination,
+            RefactorConfig(source_name=script_path.name),
+        )
+    except Exception as exc:
+        return script_path, (
+            f"Refactoring '{script_path.name}' raised {type(exc).__name__}: "
+            f"{exc}. Parsing the flat script instead, which may have few "
+            "top-level functions."
+        )
+
+    if not result.ok:
+        return script_path, (
+            f"Refactoring '{script_path.name}' failed ({result.error}). "
+            "Parsing the flat script instead, which may have few top-level "
+            "functions."
+        )
+
+    return destination, ""
+
 
 def _resolve_python_path(
     context: ToolContext, script_path: str
@@ -252,7 +310,8 @@ def _resolve_python_path(
 
     Returns:
         `(path, error, note)`. `path` and `error` are mutually exclusive.
-        `note` carries a non-fatal warning worth surfacing.
+        `note` carries a non-fatal warning worth surfacing, such as the
+        refactor having failed and the flat script being parsed instead.
     """
     src = Path(script_path)
 
@@ -265,12 +324,19 @@ def _resolve_python_path(
             ), ""
         src = Path(result["python_script_path"])
 
-    return str(src), "", ""
+    # Restructure into functions before parsing. Deterministic and cheap, so it
+    # runs unconditionally rather than being something the model decides to do.
+    refactored, note = _refactor_if_flat(src)
+    return str(refactored), "", note
 
 
 def ast_parser(context: ToolContext, script_path: str)-> dict[str, str]:
     """
     This tool will be used to parse the python script using ast parser
+
+    Restructures the script into functions first (deterministic AST refactor,
+    no model involved) and parses that, so the inventory has the per-function
+    detail the conversion loop works from.
 
     The parsed inventory is written to `outputs/ast_inventory.json` and NOT put
     in state. For a script of a few hundred functions the inventory is tens of
