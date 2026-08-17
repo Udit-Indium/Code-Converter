@@ -1,0 +1,23 @@
+# Secrets — never commit. Use .env.example as the template.
+.env
+*.env
+!.env.example
+
+# Virtualenv
+.venv/
+venv/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ADK session store (contains conversation history)
+.adk/
+
+# Generated pipeline artefacts — derived from the source notebook, and they
+# carry the same business content, so they are not published either.
+outputs/
+
+# OS noise
+.DS_Store
