@@ -33,64 +33,13 @@ ENV_CANDIDATES = (
     Path(__file__).resolve().parent.parent / ".env",  # <repo root>/.env
 )
 
-#: Populated at import so `env_status()` can report what actually happened.
-#: Every failure mode here is otherwise SILENT — a missing package, a missing
-#: file, and a file full of blank values all look identical from the outside:
-#: the variables are simply unset, and the first error you see is a KeyError
-#: from a module four imports away.
-#: File existence is recorded FIRST, independently of whether python-dotenv is
-#: importable. Otherwise a missing package would report every file as missing
-#: too, and the diagnostic would conflate the two causes it exists to separate.
-ENV_REPORT: dict[str, object] = {
-    "dotenv_installed": False,
-    "files_found": [str(p) for p in ENV_CANDIDATES if p.is_file()],
-    "files_missing": [str(p) for p in ENV_CANDIDATES if not p.is_file()],
-    "loaded": False,
-}
-
 try:
     from dotenv import load_dotenv
 
-    ENV_REPORT["dotenv_installed"] = True
     for _candidate in ENV_CANDIDATES:
         if _candidate.is_file():
             load_dotenv(_candidate, override=False)
-            ENV_REPORT["loaded"] = True
-except ImportError:
-    # Real environment variables still apply, so this is not fatal — but it
-    # does mean no .env is read at all, which is indistinguishable from an
-    # empty file unless it is reported.
-    import warnings
-
-    warnings.warn(
-        "python-dotenv is not installed, so no .env file was loaded. "
-        "Run: pip install python-dotenv",
-        RuntimeWarning,
-        stacklevel=2,
-    )
-
-
-def env_status() -> dict[str, object]:
-    """Report whether the environment actually loaded, and from where.
-
-    Run this first when a credential or quota looks unset:
-
-        python -c "import subagents, json; print(json.dumps(subagents.env_status(), indent=2))"
-    """
-    import os
-
-    required = ("DATABRICKS_HOST", "DATABRICKS_API_KEY", "USER_ID")
-    quotas = (
-        "DATABRICKS_ITPM_DATABRICKS_CLAUDE_SONNET_4_6",
-        "DATABRICKS_OTPM_DATABRICKS_CLAUDE_SONNET_4_6",
-        "DATABRICKS_ITPM_DATABRICKS_CLAUDE_OPUS_4_7",
-        "DATABRICKS_OTPM_DATABRICKS_CLAUDE_OPUS_4_7",
-    )
-    return {
-        **ENV_REPORT,
-        # Presence only — never echo a credential.
-        "required_set": {k: bool(os.environ.get(k)) for k in required},
-        "quotas_set": {k: os.environ.get(k) for k in quotas},
-    }
+except ImportError:  # python-dotenv absent — real env vars still apply
+    pass
 
 from . import litellm_patch  # noqa: E402,F401  (imported for its side effect)
