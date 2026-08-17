@@ -34,10 +34,6 @@ def refactor_script(
     The refactored file is written to the outputs directory and its path is
     returned for downstream agents.
     """
-
-    # ---------------------------------------------------------
-    # 1. Prepare notebook/script
-    # ---------------------------------------------------------
     prepared = notebook_to_python(context, script_path)
 
     if (
@@ -53,31 +49,15 @@ def refactor_script(
         }
 
     source_path = Path(prepared["python_script_path"])
-
-    # ---------------------------------------------------------
-    # 2. Output path
-    # ---------------------------------------------------------
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     destination = OUTPUT_DIR / f"{source_path.stem}_refactored.py"
-
-    # ---------------------------------------------------------
-    # 3. Optional LLM naming
-    #
-    # IMPORTANT:
-    # Keep this False during normal conversion.
-    # True causes one LLM request per block.
-    # ---------------------------------------------------------
     namer = None
 
     if use_llm_names:
         namer = LLMFunctionNamer(
             model="databricks/databricks-claude-opus-4-7"
         )
-
-    # ---------------------------------------------------------
-    # 4. Deterministic AST refactoring
-    # ---------------------------------------------------------
     config = RefactorConfig(
         blocking=BlockingConfig(),
         namer=namer,
@@ -90,9 +70,6 @@ def refactor_script(
         config,
     )
 
-    # ---------------------------------------------------------
-    # 5. Refactor failed
-    # ---------------------------------------------------------
     if not result.ok:
         return {
             "refactored": False,
@@ -103,15 +80,6 @@ def refactor_script(
             ),
             "error": str(result.error),
         }
-
-    # ---------------------------------------------------------
-    # 6. IMPORTANT:
-    # Return ONLY compact metadata.
-    #
-    # Do NOT return result.summaries().
-    # Those summaries can significantly increase the LLM
-    # context when the notebook contains many blocks.
-    # ---------------------------------------------------------
     function_names = [
         block.name
         for block in result.blocks
@@ -131,11 +99,6 @@ def refactor_script(
             f"Output: '{destination}'."
         ),
     }
-
-
-# ============================================================
-# REFACTOR AGENT
-# ============================================================
 
 script_refactor_agent = Agent(
     model=LiteLlm(
@@ -189,6 +152,4 @@ engine itself.
 
     mode="single_turn",
 )
-
-
 script_refactor_loop_agent = script_refactor_agent

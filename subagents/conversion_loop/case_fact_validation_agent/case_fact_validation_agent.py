@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import ast
 import json
@@ -9,6 +11,7 @@ from google.adk.models.lite_llm import LiteLlm
 from dotenv import load_dotenv
 
 from .tools import run_parser
+
 
 load_dotenv()
 
@@ -23,6 +26,8 @@ AST_INVENTORY = (
     / "ast_inventory.json"
 )
 
+
+# Keep only a small number of names in the LLM-visible state.
 MAX_NAMES_IN_STATE = 20
 
 
@@ -138,7 +143,7 @@ def _converted_inventory(script_path) -> dict:
 
         if isinstance(
             node,
-            (ast.FunctionDef, ast.AsyncFunctionDef)
+            (ast.FunctionDef, ast.AsyncFunctionDef),
         ):
             functions.append(node.name)
 
@@ -155,6 +160,7 @@ def _converted_inventory(script_path) -> dict:
                 constants[node.targets[0].id] = ast.literal_eval(
                     node.value
                 )
+
             except (ValueError, SyntaxError):
                 constants[node.targets[0].id] = ast.unparse(
                     node.value
@@ -185,6 +191,10 @@ def load_facts(callback_context: CallbackContext) -> None:
     state = callback_context.state
 
     facts = _source_facts()
+
+    # --------------------------------------------------------
+    # EMPTY SOURCE CHECK
+    # --------------------------------------------------------
 
     if (
         facts["function_count"] == 0
@@ -218,6 +228,10 @@ def load_facts(callback_context: CallbackContext) -> None:
 
         return None
 
+    # --------------------------------------------------------
+    # CONVERTED FILE
+    # --------------------------------------------------------
+
     script_path = state.get(
         "converted_pyspark_file_path"
     )
@@ -241,9 +255,12 @@ def load_facts(callback_context: CallbackContext) -> None:
         "constant_count": len(converted["constants"]),
     }
 
-    # Keep complete facts locally for the deterministic callback.
+    # --------------------------------------------------------
+    # Keep complete facts locally for deterministic validation.
     #
-    # These are NOT injected into the model prompt.
+    # These are NOT directly injected into the model prompt.
+    # --------------------------------------------------------
+
     state["_case_fact_source"] = facts
 
     return None
@@ -266,17 +283,17 @@ def check_fact_status(callback_context: CallbackContext) -> None:
 
     source_functions = facts.get(
         "function_names",
-        []
+        [],
     )
 
     source_classes = facts.get(
         "class_names",
-        []
+        [],
     )
 
     source_constants = facts.get(
         "constants",
-        {}
+        {},
     )
 
     # --------------------------------------------------------
@@ -342,7 +359,7 @@ def check_fact_status(callback_context: CallbackContext) -> None:
     try:
         parsed = run_parser(
             script_path,
-            follow_imports=False
+            follow_imports=False,
         )
 
     except Exception as exc:
@@ -392,7 +409,7 @@ def check_fact_status(callback_context: CallbackContext) -> None:
 
     if not isinstance(
         converted_constants,
-        dict
+        dict,
     ):
         converted_constants = {}
 
@@ -461,6 +478,7 @@ def check_fact_status(callback_context: CallbackContext) -> None:
 
         # IMPORTANT:
         # Do NOT store the huge lists in state.
+
         "function_missing_count": len(
             missing_functions
         ),
@@ -511,32 +529,53 @@ case_fact_checker_agent = Agent(
     instruction="""
 You are a case-fact validation agent.
 
-Validate only the structural facts of the Python-to-PySpark
-conversion:
+Your responsibility is ONLY to provide a short structural
+assessment of the Python-to-PySpark conversion.
+
+Validate only:
 
 1. Number of functions
 2. Number of classes
 3. Number of module-level constants
 
-The actual deterministic validation is performed by the
-Python callback. Do not invent results.
+IMPORTANT:
 
-The callback will compare the source AST and converted AST
-directly.
+The actual validation is performed deterministically by the
+Python callback.
+
+Do NOT invent results.
+
+The callback directly compares the source AST and converted AST.
 
 Source facts:
+
 <case_facts>
 {case_facts}
 </case_facts>
 
 Converted inventory:
+
 <converted_inventory>
 {converted_inventory}
 </converted_inventory>
 
-Report a short structural assessment only.
-Do NOT reproduce lists of function names or source code.
+Report ONLY a short structural assessment.
+
+Do NOT:
+
+- reproduce source code
+- reproduce converted code
+- reproduce complete function lists
+- reproduce complete class lists
+- reproduce constant values
+- perform your own lengthy analysis
+- repeat the validation rules unnecessarily
+
+The deterministic callback is authoritative for pass/fail.
 """,
+
+
+    include_contents="none",
 
     mode="single_turn",
 

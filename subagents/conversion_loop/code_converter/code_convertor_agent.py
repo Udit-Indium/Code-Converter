@@ -362,54 +362,34 @@ def _source_text() -> str:
 def read_source_index_tool(context: ToolContext) -> dict:
     """Return a compact source overview without function bodies.
 
-    The normal conversion path already injects the next batch through
-    ``next_batch_source``. Use this tool only when metadata such as
-    parameters or module constants is genuinely needed.
+    Normally the converter does not need this tool because the next batch is
+    already injected by _next_batch_source(). Use it only when metadata is
+    genuinely required.
     """
     src = _source_text()
     if not src.strip():
-        return {
-            "available": False,
-            "count": 0,
-            "functions": [],
-            "error": "source script not found",
-        }
-
+        return {"available": False, "count": 0, "functions": [],
+                "error": "source script not found"}
     try:
         tree = ast.parse(src)
     except SyntaxError as exc:
-        return {
-            "available": False,
-            "count": 0,
-            "functions": [],
-            "error": f"source has a syntax error: {exc}",
-        }
+        return {"available": False, "count": 0, "functions": [],
+                "error": f"source has a syntax error: {exc}"}
 
     functions = []
     for node in tree.body:
-        if not isinstance(
-            node,
-            (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
-        ):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
-
-        entry = {
-            "name": node.name,
-            "kind": type(node).__name__,
-        }
-
+        entry = {"name": node.name, "kind": type(node).__name__}
         if not isinstance(node, ast.ClassDef):
             entry["parameters"] = [arg.arg for arg in node.args.args]
-
         functions.append(entry)
 
     return {
         "available": True,
         "count": len(functions),
         "functions": functions,
-        "constants": sorted(
-            (_inventory().get("constants") or {}).keys()
-        ),
+        "constants": sorted((_inventory().get("constants") or {}).keys()),
     }
 
 
@@ -814,7 +794,7 @@ def execute_pyspark_script_tool(context: ToolContext) -> dict:
             r = requests.get(
                 f"{HOST}/api/2.2/jobs/runs/get",
                 headers=HEADERS,
-                params={"run_id":run_id},
+                params={"run_id": run_id},
             )
 
             r.raise_for_status()
@@ -877,9 +857,9 @@ def execute_pyspark_script_tool(context: ToolContext) -> dict:
                     "recursive":False,
                 },
             )
-            # Cleanup is intentionally silent; the tool already returns a compact result.
-        except Exception:
-            pass
+            print("workspace_deleted")
+        except Exception as ex:
+            print("cleanup failed")
 
 
 py_to_spark_skill = load_skill_from_dir(
@@ -919,14 +899,14 @@ code_convertor_agent = Agent(
 
     Other tools, only if you actually need them (each call costs a full round-trip):
       * **read_source_functions_tool(function_names=[...])** — ONLY if a body is
-        missing from the batch above or you genuinely need to re-check it.
+        missing from the supplied batch or you genuinely need to re-check it.
       * **read_source_index_tool()** — ONLY if you need metadata such as parameters
         or module constants that is not available from the current batch.
       * **read_migration_progress_tool()** — ONLY if progress is unclear.
       * **read_converted_file_tool()** — ONLY if you need output function names.
       * Do NOT repeatedly call a tool for information already present in this turn.
-      * Do NOT repeatedly load/re-read the same skill resource. The py2snow-skill
-        remains authoritative and available through SkillToolset.
+      * Do NOT repeatedly load/re-read the same skill resource in one turn. The
+        py2snow-skill remains authoritative and available through SkillToolset.
 
     WORK-STATE (compact):
     <case_fact_status>
@@ -1012,8 +992,8 @@ code_fixer_agent = Agent(
     fix ONLY the functions that are actually failing, one small batch at a time.
 
     MANDATORY conversion conventions: use the **py2snow-skill** through the SkillToolset
-    for native Spark rules. Keep the skill available because it is authoritative, but do not
-    repeatedly reload or reproduce the same skill resources in context. Never introduce pandas idioms (`pd.`, `.merge`, `.rename(columns=)`, `.iloc`, `df.apply`)
+    for native Spark rules. Do not reproduce the full skill/reference corpus in context.
+    Never introduce pandas idioms (`pd.`, `.merge`, `.rename(columns=)`, `.iloc`, `df.apply`)
     or numpy column-building patterns into the corrected code.
 
     Condensed pytest result — this lists only the FAILING tests and a short error for
@@ -1089,8 +1069,8 @@ semantic_code_fixer_agent = Agent(
     editing ONLY the functions responsible for the differences — surgically, in batches.
 
     MANDATORY conversion conventions: use the **py2snow-skill** through the SkillToolset
-    for native Spark rules. Keep the skill available because it is authoritative, but do not
-    repeatedly reload or reproduce the same skill resources in context. Never introduce pandas idioms (`pd.`, `.merge`, `.rename(columns=)`, `.iloc`, `df.apply`)
+    for native Spark rules. Do not reproduce the full skill/reference corpus in context.
+    Never introduce pandas idioms (`pd.`, `.merge`, `.rename(columns=)`, `.iloc`, `df.apply`)
     or numpy column-building patterns into the corrected code.
 
     Semantic comparison verdict (differences between the two outputs — these describe

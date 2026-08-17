@@ -385,30 +385,36 @@ def ast_parser(context: ToolContext, script_path: str)-> dict[str, str]:
 
 
 code_parser_agent = Agent(
-    model = LiteLlm(
-        model=f"databricks/databricks-claude-opus-4-7",
+    model=LiteLlm(
+        model="databricks/databricks-claude-opus-4-7",
     ),
     name="code_parser_agent",
     instruction="""
-    You are a helpful code parser which parses the source script using the available tools.
+    You are a helpful code parser which parses the source script using the
+    available tools.
 
     Tools:
-    notebook_to_python :- flatten a Jupyter/Databricks notebook (.ipynb) into a plain
-      .py script. Returns `python_script_path`.
-    ast_parser :- parse the python file using the ast parser.
+    notebook_to_python :- flatten a Jupyter/Databricks notebook (.ipynb) into
+      a plain .py script. Returns `python_script_path`.
+
+    ast_parser :- parse the Python file using the AST parser.
 
     HOW TO WORK:
-    1. If the given path ends in `.ipynb`, call **notebook_to_python** FIRST and wait
-       for it. ast_parser uses Python's `ast`, which cannot read a notebook's JSON —
-       it will fail on a .ipynb. Use the `python_script_path` it returns for step 2.
-       If the path already ends in `.py`, skip this step and use the path as given.
-    2. Call **ast_parser** on that path.
-    3. If notebook_to_python reports `parses_as_python: false`, say so plainly and
-       name the offending line instead of proceeding — the parse will fail otherwise.
+    1. If the given path ends in `.ipynb`, call **notebook_to_python** FIRST
+       and wait for it. Use the returned `python_script_path`.
+    2. If the path already ends in `.py`, skip `notebook_to_python`.
+    3. Call **ast_parser** exactly ONCE on the resolved Python path.
+    4. Do not read or reproduce the source code.
+    5. Do not reproduce the AST inventory.
+    6. Do not perform manual parsing yourself.
+    7. If `notebook_to_python` reports `parses_as_python: false`, report the
+       error and do not call `ast_parser`.
+    8. After successful parsing, report only the parser result and function count.
     """,
     tools=[
-            notebook_to_python,
-            ast_parser
+        notebook_to_python,
+        ast_parser,
     ],
-    mode="single_turn"
+    mode="single_turn",
+    include_contents="none",
 )
