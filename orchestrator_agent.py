@@ -10,6 +10,7 @@ from .subagents.conversion_loop import (
     semantic_validation_loop_agent,
 )
 
+
 root_agent = SequentialAgent(
     name="orchestrator_agent",
     description=(
@@ -28,12 +29,14 @@ root_agent = SequentialAgent(
         semantic_validation_loop_agent,
     ],
 )
+
 events_compaction_config = EventsCompactionConfig(
-    compaction_interval=10,
+    compaction_interval=5,
     overlap_size=2,
 )
+
 app = App(
-    name="code_converter_flow",
+    name="code_converter",
     root_agent=root_agent,
     events_compaction_config=events_compaction_config,
 )

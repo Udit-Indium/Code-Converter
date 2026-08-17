@@ -360,43 +360,57 @@ def _source_text() -> str:
 
 
 def read_source_index_tool(context: ToolContext) -> dict:
-    """List every function in the SOURCE script — name, signature, size, risk.
+    """Return a compact source overview without function bodies.
 
-    This is the cheap overview: it tells you WHAT exists and how big each piece
-    is, without pulling any function bodies into context. Use it to plan your
-    batches, then call read_source_functions_tool for the bodies of just the
-    handful you are converting this turn.
+    The normal conversion path already injects the next batch through
+    ``next_batch_source``. Use this tool only when metadata such as
+    parameters or module constants is genuinely needed.
     """
     src = _source_text()
     if not src.strip():
-        return {"available": False, "functions": [], "error": "source script not found"}
+        return {
+            "available": False,
+            "count": 0,
+            "functions": [],
+            "error": "source script not found",
+        }
+
     try:
         tree = ast.parse(src)
     except SyntaxError as exc:
-        return {"available": False, "functions": [], "error": f"source has a syntax error: {exc}"}
+        return {
+            "available": False,
+            "count": 0,
+            "functions": [],
+            "error": f"source has a syntax error: {exc}",
+        }
 
-    apc = _inventory()
-    risk_by_name = {
-        f.get("name"): (f.get("pyspark") or {}).get("risk")
-        for f in (apc.get("functions") or []) if isinstance(f, dict)
-    }
-
-    index = []
-    for n in tree.body:
-        if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+    functions = []
+    for node in tree.body:
+        if not isinstance(
+            node,
+            (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+        ):
             continue
-        entry = {"name": n.name, "kind": type(n).__name__,
-                 "lines": (getattr(n, "end_lineno", n.lineno) or n.lineno) - n.lineno + 1}
-        if not isinstance(n, ast.ClassDef):
-            args = [a.arg for a in n.args.args]
-            entry["parameters"] = args
-            entry["returns"] = ast.unparse(n.returns) if n.returns else None
-        if risk_by_name.get(n.name):
-            entry["risk"] = risk_by_name[n.name]
-        index.append(entry)
 
-    return {"available": True, "count": len(index), "functions": index,
-            "constants": sorted((apc.get("constants") or {}).keys())}
+        entry = {
+            "name": node.name,
+            "kind": type(node).__name__,
+        }
+
+        if not isinstance(node, ast.ClassDef):
+            entry["parameters"] = [arg.arg for arg in node.args.args]
+
+        functions.append(entry)
+
+    return {
+        "available": True,
+        "count": len(functions),
+        "functions": functions,
+        "constants": sorted(
+            (_inventory().get("constants") or {}).keys()
+        ),
+    }
 
 
 def read_migration_progress_tool(context: ToolContext) -> dict:
@@ -753,14 +767,14 @@ def execute_pyspark_script_tool(context: ToolContext) -> dict:
             json=upload_payload
         )
 
-        print(r.status_code)
-        print(r.text)
-        r.raise_for_status()
-
         if not r.ok:
-            print(r.status_code, r.text)
-
-        print("script_uploaded")
+            return {
+                "success": False,
+                "file_path": python_script_path,
+                "status_code": r.status_code,
+                "error": _tail(r.text, 1000),
+            }
+        r.raise_for_status()
 
         submit_payload = {
             "run_name":"varification",
@@ -793,7 +807,6 @@ def execute_pyspark_script_tool(context: ToolContext) -> dict:
         r.raise_for_status()
 
         run_id = r.json()["run_id"]
-        print("Job submitted with run_id", run_id)
 
         start = time.time()
 
@@ -806,11 +819,9 @@ def execute_pyspark_script_tool(context: ToolContext) -> dict:
 
             r.raise_for_status()
             info = r.json()
-            print(info)
             task = info["tasks"][0]
             task_run_id = task["run_id"]
             state = task["state"]["life_cycle_state"]
-            print(state)
 
             if state in ["TERMINATED", "INTERNAL_ERROR", "SKIPPED"]:
                 break
@@ -866,9 +877,9 @@ def execute_pyspark_script_tool(context: ToolContext) -> dict:
                     "recursive":False,
                 },
             )
-            print("workspace_deleted")
-        except Exception as ex:
-            print("cleanup failed")
+            # Cleanup is intentionally silent; the tool already returns a compact result.
+        except Exception:
+            pass
 
 
 py_to_spark_skill = load_skill_from_dir(
@@ -891,24 +902,31 @@ code_convertor_agent = Agent(
     "# continue similarly" stubs — which is a failure).
 
     MANDATORY conversion conventions: use the **py2snow-skill** through the SkillToolset
-    for the native-Spark conversion rules. Do not load or reproduce the entire skill/reference
-    corpus in your response. In particular, use native Spark APIs and avoid pandas idioms
+    for the native-Spark conversion rules. The skill MUST remain available and is the
+    authoritative source for detailed conversion conventions. Use its resources when
+    needed, but do not repeatedly reload or reread the same skill resource in one turn,
+    and never reproduce the entire skill/reference corpus in the response. In particular,
+    use native Spark APIs and avoid pandas idioms
     (`pd.`, `.merge`, `.rename(columns=...)`, `.iloc`, `df.apply`) and numpy column-building
     patterns unless the source is a deterministic data-generation function.
 
     THIS TURN'S BATCH — the original source of the next functions to convert is
-    already here. Convert exactly these; do NOT call a tool to fetch them:
+    already here. Convert exactly these; do NOT call a tool to fetch them unless a
+    body is actually missing or you need to verify a specific function:
     <batch_source>
     {next_batch_source}
     </batch_source>
 
     Other tools, only if you actually need them (each call costs a full round-trip):
-      * **read_source_functions_tool(function_names=[...])** — a body missing from
-        the batch above, or one you need to re-check.
-      * **read_source_index_tool()** — names, parameters, constants.
-      * **read_migration_progress_tool()** — converted vs remaining.
-      * **read_converted_file_tool()** — which functions are in the output so far
-        (names only, no code).
+      * **read_source_functions_tool(function_names=[...])** — ONLY if a body is
+        missing from the batch above or you genuinely need to re-check it.
+      * **read_source_index_tool()** — ONLY if you need metadata such as parameters
+        or module constants that is not available from the current batch.
+      * **read_migration_progress_tool()** — ONLY if progress is unclear.
+      * **read_converted_file_tool()** — ONLY if you need output function names.
+      * Do NOT repeatedly call a tool for information already present in this turn.
+      * Do NOT repeatedly load/re-read the same skill resource. The py2snow-skill
+        remains authoritative and available through SkillToolset.
 
     WORK-STATE (compact):
     <case_fact_status>
@@ -916,7 +934,8 @@ code_convertor_agent = Agent(
     </case_fact_status>
 
     The complete work-list is derived from the source and converted files on disk.
-    Do not ask for or reproduce the whole list; convert only <batch_source>.
+    Do not ask for, reproduce, or store the whole work-list in state; convert only
+    <batch_source>.
 
     You can use the **py2snow-skill** to guide each conversion.
 
@@ -993,8 +1012,8 @@ code_fixer_agent = Agent(
     fix ONLY the functions that are actually failing, one small batch at a time.
 
     MANDATORY conversion conventions: use the **py2snow-skill** through the SkillToolset
-    for native Spark rules. Do not reproduce the full skill/reference corpus in context.
-    Never introduce pandas idioms (`pd.`, `.merge`, `.rename(columns=)`, `.iloc`, `df.apply`)
+    for native Spark rules. Keep the skill available because it is authoritative, but do not
+    repeatedly reload or reproduce the same skill resources in context. Never introduce pandas idioms (`pd.`, `.merge`, `.rename(columns=)`, `.iloc`, `df.apply`)
     or numpy column-building patterns into the corrected code.
 
     Condensed pytest result — this lists only the FAILING tests and a short error for
@@ -1070,8 +1089,8 @@ semantic_code_fixer_agent = Agent(
     editing ONLY the functions responsible for the differences — surgically, in batches.
 
     MANDATORY conversion conventions: use the **py2snow-skill** through the SkillToolset
-    for native Spark rules. Do not reproduce the full skill/reference corpus in context.
-    Never introduce pandas idioms (`pd.`, `.merge`, `.rename(columns=)`, `.iloc`, `df.apply`)
+    for native Spark rules. Keep the skill available because it is authoritative, but do not
+    repeatedly reload or reproduce the same skill resources in context. Never introduce pandas idioms (`pd.`, `.merge`, `.rename(columns=)`, `.iloc`, `df.apply`)
     or numpy column-building patterns into the corrected code.
 
     Semantic comparison verdict (differences between the two outputs — these describe
