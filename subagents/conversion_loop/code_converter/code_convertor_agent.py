@@ -581,7 +581,7 @@ def read_converted_file_tool(context: ToolContext) -> dict:
 
 
 
-BATCH_SIZE = 10
+BATCH_SIZE = 4
 
 
 def _next_batch_source(state) -> str:
