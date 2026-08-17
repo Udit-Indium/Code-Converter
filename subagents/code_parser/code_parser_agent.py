@@ -174,11 +174,8 @@ def notebook_to_python(context: ToolContext, script_path: str) -> dict[str, str]
         text = "\n".join(rows) + "\n"
         parses, parse_error, error_context, bad_line = _parse_report(text)
 
-    # Rewrite only when the content actually differs. This is what makes the
-    # refactored file's staleness check meaningful downstream: this function
-    # runs again on every pipeline pass, and an unconditional write would bump
-    # the flat script's mtime past the refactored script derived from it,
-    # making a perfectly current refactor look stale on every single run.
+    # Rewrite only when the content actually differs, so a re-run does not
+    # churn the file's mtime for output that has not changed.
     unchanged = False
     try:
         unchanged = out_path.is_file() and out_path.read_text(encoding="utf-8") == text
@@ -240,54 +237,6 @@ OUTPUT_DIR = Path(__file__).parent.parent.parent / "outputs"
 #: input filename so a consumer needs no knowledge of what was parsed.
 AST_INVENTORY = OUTPUT_DIR / "ast_inventory.json"
 
-#: Suffix the refactor stage appends to the script it restructures.
-_REFACTORED_SUFFIX = "_refactored"
-
-
-def _find_refactored(script_path: Path) -> tuple[Path | None, str]:
-    """Return the refactor stage's output for `script_path`, if it is usable.
-
-    This is a naming convention rather than a lookup in agent state, and that
-    is deliberate: `notebook_to_python` rewrites its own state key every time it
-    runs, so a state-based handoff let a later stage silently overwrite the
-    refactored path and undo the refactor. A file either exists on disk or it
-    does not.
-
-    A refactored file OLDER than the script it was derived from is left behind
-    by a previous run against different source. Using it would convert stale
-    code and say nothing, so it is rejected — but loudly, via the returned
-    note, because the alternative (parsing the flat script) yields a nearly
-    empty inventory and the operator needs to know why.
-
-    Returns:
-        `(path, note)`. `path` is None when there is no usable refactored
-        version — the normal case for a script that was already modular.
-        `note` is non-empty only when something needs saying.
-    """
-    # Already the refactored file: do not look for `..._refactored_refactored`.
-    if script_path.stem.endswith(_REFACTORED_SUFFIX):
-        return (script_path if script_path.is_file() else None), ""
-
-    candidate = OUTPUT_DIR / f"{script_path.stem}{_REFACTORED_SUFFIX}.py"
-    if not candidate.is_file():
-        return None, ""
-
-    try:
-        if candidate.stat().st_mtime < script_path.stat().st_mtime:
-            return None, (
-                f"IGNORED a stale refactored script: '{candidate.name}' is older "
-                f"than the source it came from ('{script_path.name}'), so it "
-                "reflects a previous version. Parsing the flat script instead, "
-                "which has few top-level functions — re-run the refactor stage "
-                "to fix this."
-            )
-    except OSError:
-        # Cannot compare timestamps; prefer the refactored file, since that is
-        # the case this whole lookup exists to serve.
-        return candidate, ""
-
-    return candidate, ""
-
 
 def _resolve_python_path(
     context: ToolContext, script_path: str
@@ -303,8 +252,7 @@ def _resolve_python_path(
 
     Returns:
         `(path, error, note)`. `path` and `error` are mutually exclusive.
-        `note` carries a non-fatal warning worth surfacing, such as a stale
-        refactored script having been ignored.
+        `note` carries a non-fatal warning worth surfacing.
     """
     src = Path(script_path)
 
@@ -317,21 +265,12 @@ def _resolve_python_path(
             ), ""
         src = Path(result["python_script_path"])
 
-    # Prefer the refactor stage's output, found by naming convention rather
-    # than through state. The flat script has almost no top-level functions and
-    # the converter works function by function, so parsing the flat version
-    # when a refactored one exists would hand the converter an empty inventory
-    # and no explanation.
-    refactored, note = _find_refactored(src)
-    return str(refactored or src), "", note
+    return str(src), "", ""
 
 
 def ast_parser(context: ToolContext, script_path: str)-> dict[str, str]:
     """
     This tool will be used to parse the python script using ast parser
-
-    Parses the REFACTORED script when the refactor stage produced one, found by
-    naming convention rather than through state.
 
     The parsed inventory is written to `outputs/ast_inventory.json` and NOT put
     in state. For a script of a few hundred functions the inventory is tens of
