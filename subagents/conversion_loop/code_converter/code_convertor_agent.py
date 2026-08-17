@@ -69,6 +69,10 @@ def _as_dict(value):
 
 AST_INVENTORY = OUTPUTS_DIR / "ast_inventory.json"
 
+# Cap on a single constant's string value in read_source_index_tool, so one
+# embedded SQL blob cannot crowd out every other constant in the response.
+MAX_CONSTANT_VALUE_CHARS = 500
+
 
 def _inventory() -> dict:
     """Load the parsed AST inventory from disk.
@@ -389,8 +393,32 @@ def read_source_index_tool(context: ToolContext) -> dict:
         "available": True,
         "count": len(functions),
         "functions": functions,
-        "constants": sorted((_inventory().get("constants") or {}).keys()),
+        # Values, not just names. The case-fact checker reports a constant
+        # mismatch as a bare NAME, so if this tool also returned only names the
+        # converter had no way at all to learn the value it was supposed to
+        # write — it would burn its turn hunting for the raw source through the
+        # skill tools and then guess. The parser already stores the literal
+        # values in the inventory; hand them over.
+        "constants": _source_constants(),
     }
+
+
+def _source_constants() -> dict:
+    """Module-level constant name -> literal value, from the AST inventory.
+
+    Long values are truncated with a marker rather than dropped: a constant the
+    converter can see is wrong is far more useful than one it cannot see at all.
+    """
+    consts = _inventory().get("constants") or {}
+    if not isinstance(consts, dict):
+        return {}
+    out = {}
+    for name in sorted(consts):
+        value = consts[name]
+        if isinstance(value, str) and len(value) > MAX_CONSTANT_VALUE_CHARS:
+            value = value[:MAX_CONSTANT_VALUE_CHARS] + "...<truncated>"
+        out[name] = value
+    return out
 
 
 def read_migration_progress_tool(context: ToolContext) -> dict:
@@ -938,7 +966,10 @@ code_convertor_agent = Agent(
     3. Call **add_converted_functions_tool(functions_code=...)** passing ONLY this batch's
        new functions. On the FIRST batch also include: the needed `import` lines (pyspark
        imports, etc.) AND every module-level constant from the source with its EXACT value
-       (see `constant_value_mismatch`; read_source_index_tool lists the constant names).
+       (`constant_value_mismatch` names the constants that are wrong;
+       read_source_index_tool returns every constant name WITH its exact value —
+       that tool is the only place the values come from, so use it instead of
+       hunting for the raw source through the skill).
        Do NOT resend functions already in the file — the tool merges and de-dupes by name;
        it returns `converted_count`, `remaining_count`, and a small `remaining_sample`; use the count as the authoritative progress signal.
     4. STOP your turn as soon as the batch is appended. The loop re-invokes you with a freshly computed next batch; keep going batch by batch until `remaining_count` is 0.
