@@ -24,28 +24,6 @@ _MAX_LOG_CHARS = 3000
 _SKILL_DIR = pathlib.Path(__file__).parent / "skills" / "py2snow-skill"
 
 
-def _load_conventions() -> str:
-    """Read the PySpark conversion conventions (SKILL.md + the ETL reference) at
-    import time so they can be injected DIRECTLY into the converter/fixer context
-    every turn. SkillToolset only exposes these as on-demand tools, and the
-    per-batch loop starts a fresh LLM context each time — so the model routinely
-    skips loading them and reverts to pandas idioms. Inlining guarantees the
-    'no pandas, use native Spark' rules are always in front of the model."""
-    parts: list[str] = []
-    paths = [_SKILL_DIR / "SKILL.md"]
-    paths += sorted((_SKILL_DIR / "references").glob("*.md"))
-    for f in paths:
-        try:
-            rel = f.relative_to(_SKILL_DIR)
-            parts.append(f"===== {rel} =====\n{f.read_text(encoding='utf-8')}")
-        except OSError:
-            pass
-    return "\n\n".join(parts)
-
-
-_PYSPARK_CONVENTIONS = _load_conventions()
-
-
 def _tail(text: "str | None", limit: int = _MAX_LOG_CHARS) -> str:
     """Keep only the last `limit` chars of tool output so verbose PySpark logs
     don't accumulate in the LLM context window."""
@@ -428,12 +406,22 @@ def read_migration_progress_tool(context: ToolContext) -> dict:
     it to confirm what is left rather than assuming.
     """
     try:
-        return json.loads(PROGRESS_FILE.read_text(encoding="utf-8"))
+        progress = json.loads(PROGRESS_FILE.read_text(encoding="utf-8"))
+        # Keep the tool response compact; the full lists remain on disk.
+        return {
+            "source_function_count": progress.get("source_function_count", 0),
+            "converted_count": progress.get("converted_count", 0),
+            "remaining_count": progress.get("remaining_count", 0),
+            "percent_complete": progress.get("percent_complete", 0.0),
+            "remaining_sample": (progress.get("remaining") or [])[:20],
+            "extra_in_output_count": len(progress.get("extra_in_output") or []),
+            "output_file": progress.get("output_file"),
+        }
     except (OSError, ValueError):
         source = _source_function_names()
         return {"source_function_count": len(source), "converted_count": 0,
                 "remaining_count": len(source), "percent_complete": 0.0,
-                "converted": [], "remaining": source, "extra_in_output": [],
+                "remaining_sample": source[:20], "extra_in_output_count": 0,
                 "output_file": context.state.get("converted_pyspark_file_path")}
 
 
@@ -474,7 +462,8 @@ def add_converted_functions_tool(context: ToolContext, functions_code: str) -> d
         "converted_count": progress["converted_count"],
         "remaining_count": progress["remaining_count"],
         "percent_complete": progress["percent_complete"],
-        "remaining": progress["remaining"],
+        "remaining_sample": progress["remaining"][:20],
+        "remaining_truncated": len(progress["remaining"]) > 20,
     }
 
     # Deterministic check of the rule the conventions repeat hardest. Reported
@@ -598,7 +587,7 @@ def read_converted_file_tool(context: ToolContext) -> dict:
 
 
 
-BATCH_SIZE = 8
+BATCH_SIZE = 4
 
 
 def _next_batch_source(state) -> str:
@@ -609,7 +598,22 @@ def _next_batch_source(state) -> str:
     conventions block — so paying ~2k of prompt here saves ~12k of round-trip.
     The model gets exactly the same bodies either way.
     """
-    missing = (state.get("status") or {}).get("function_missing") or []
+    # Derive the work-list from disk instead of storing the full list in ADK state.
+    # ADK may carry state into every model turn, so keeping hundreds of function
+    # names in state can become a large repeated prompt payload.
+    source_names = _source_function_names()
+    output_path = _canonical_output_path(state)
+    converted_names: set[str] = set()
+    if output_path.exists():
+        try:
+            tree = ast.parse(output_path.read_text(encoding="utf-8"))
+            converted_names = {
+                n.name for n in tree.body
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            }
+        except (OSError, SyntaxError):
+            converted_names = set()
+    missing = [name for name in source_names if name not in converted_names]
     if not missing:
         return "(nothing left to convert)"
     batch = missing[:BATCH_SIZE]
@@ -634,39 +638,63 @@ def _next_batch_source(state) -> str:
     return out or "(no bodies found — use read_source_functions_tool)"
 
 
-def seed_fact_status(callback_context: CallbackContext) -> None:
-    """Ensure state["status"] exists before the converter's prompt renders.
+def _compact_case_fact_status(state) -> dict:
+    """Build a small status object for the model without carrying the full work-list.
 
-    The converter is the FIRST agent in the conversion loop, so on iteration 1
-    the deterministic case-fact verdict does not exist yet. Seed it with the
-    FULL list of source function names as `function_missing` so the converter
-    always drives off `status.function_missing` uniformly (iteration 1 = all
-    functions missing). On later iterations the real verdict written by
-    case_fact_checker_agent is already present and is left untouched.
+    The complete migration lists live in migration_progress.json / the converted file.
+    Keeping them out of ADK state prevents them from being echoed into every LLM turn.
     """
-    callback_context.state.setdefault("status", {
-        "status": "error",
-        "function_missing": _source_function_names(),
-        "classes_missing": [],
-        "constant_value_mismatch": [],
+    existing = state.get("status") or {}
+    converted_names = _converted_function_names(state)
+    missing = [
+        name for name in _source_function_names()
+        if name not in converted_names
+    ]
+    mismatch = existing.get("constant_value_mismatch") or []
+    return {
+        "status": existing.get("status", "error"),
+        "function_missing_count": len(missing),
+        "function_missing_sample": missing[:20],
+        "constant_value_mismatch": mismatch[:20],
+        "constant_value_mismatch_truncated": len(mismatch) > 20,
         "message": (
-            "First conversion pass — convert the functions listed in "
-            "function_missing, in batches."
+            "Convert the next batch of functions. The authoritative work-list "
+            "is derived from the source and converted files on disk."
         ),
-    })
-    # Always keep the conversion conventions in front of the model (see
-    # _load_conventions) — set every turn so the value is never missing.
-    callback_context.state["pyspark_conventions"] = _PYSPARK_CONVENTIONS
-    callback_context.state["next_batch_source"] = _next_batch_source(
-        callback_context.state)
+    }
+
+
+def _converted_function_names(state) -> set[str]:
+    """Return names already present in the assembled converted file."""
+    p = _canonical_output_path(state)
+    if not p.exists():
+        return set()
+    try:
+        tree = ast.parse(p.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError):
+        return set()
+    return {
+        n.name for n in tree.body
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+
+
+def seed_fact_status(callback_context: CallbackContext) -> None:
+    """Prepare only compact, deterministic state for the converter turn."""
+    state = callback_context.state
+    state["status"] = _compact_case_fact_status(state)
+    state["next_batch_source"] = _next_batch_source(state)
     return None
 
 
 def seed_conventions(callback_context: CallbackContext) -> None:
-    """Ensure the conversion conventions are in state for the fixer agents too
-    (they generate PySpark and can otherwise reintroduce pandas idioms)."""
-    callback_context.state["pyspark_conventions"] = _PYSPARK_CONVENTIONS
+    """Keep fixer state compact; conventions are supplied by the SkillToolset."""
+    state = callback_context.state
+    # Do not inject the complete SKILL.md/reference corpus into state.
+    # The SkillToolset remains available to the fixer when it needs conventions.
+    state.pop("pyspark_conventions", None)
     return None
+
 
 HOST = os.environ["DATABRICKS_HOST"]
 TOKEN = os.environ["DATABRICKS_API_KEY"]
@@ -862,14 +890,11 @@ code_convertor_agent = Agent(
     file. You must NEVER try to output the whole file at once (that truncates and produces
     "# continue similarly" stubs — which is a failure).
 
-    MANDATORY conversion conventions — read and follow these EXACTLY. They tell you
-    the native-Spark equivalent for every pandas/numpy pattern. You must produce
-    DISTRIBUTED PySpark: NEVER use pandas (`pd.`, `.merge`, `.rename(columns=...)`,
-    `.iloc`, `df.apply`), NEVER use numpy (`np.`) or Python loops to build columns —
-    use the Spark DataFrame API and `pyspark.sql.functions` per these conventions:
-    <pyspark_conversion_conventions>
-    {pyspark_conventions}
-    </pyspark_conversion_conventions>
+    MANDATORY conversion conventions: use the **py2snow-skill** through the SkillToolset
+    for the native-Spark conversion rules. Do not load or reproduce the entire skill/reference
+    corpus in your response. In particular, use native Spark APIs and avoid pandas idioms
+    (`pd.`, `.merge`, `.rename(columns=...)`, `.iloc`, `df.apply`) and numpy column-building
+    patterns unless the source is a deterministic data-generation function.
 
     THIS TURN'S BATCH — the original source of the next functions to convert is
     already here. Convert exactly these; do NOT call a tool to fetch them:
@@ -885,12 +910,13 @@ code_convertor_agent = Agent(
       * **read_converted_file_tool()** — which functions are in the output so far
         (names only, no code).
 
-    AUTHORITATIVE work-list — this is computed by AST-parsing the current output file, not
-    guessed. `function_missing` is the EXACT set of functions still NOT in the file;
-    `constant_value_mismatch` lists constants still wrong/absent:
+    WORK-STATE (compact):
     <case_fact_status>
     {status}
     </case_fact_status>
+
+    The complete work-list is derived from the source and converted files on disk.
+    Do not ask for or reproduce the whole list; convert only <batch_source>.
 
     You can use the **py2snow-skill** to guide each conversion.
 
@@ -907,10 +933,8 @@ code_convertor_agent = Agent(
        imports, etc.) AND every module-level constant from the source with its EXACT value
        (see `constant_value_mismatch`; read_source_index_tool lists the constant names).
        Do NOT resend functions already in the file — the tool merges and de-dupes by name;
-       it returns `converted_count`, `remaining_count` and `remaining` so you can see
-       progress without re-reading anything.
-    4. STOP your turn as soon as the batch is appended. The loop re-invokes you with
-       an updated `function_missing`; keep going batch by batch until it is empty.
+       it returns `converted_count`, `remaining_count`, and a small `remaining_sample`; use the count as the authoritative progress signal.
+    4. STOP your turn as soon as the batch is appended. The loop re-invokes you with a freshly computed next batch; keep going batch by batch until `remaining_count` is 0.
     5. ONLY when `remaining_count` comes back 0 — the final batch — call
        **execute_pyspark_script_tool** once as a whole-file check. Do NOT run it after
        every batch: the converted file is a function library, so running it only
@@ -954,7 +978,7 @@ code_convertor_agent = Agent(
     ],
 
     mode="task",
-    output_key="pyspark_conversion_output",
+    output_key="code_converter_output",
     before_agent_callback=seed_fact_status,
 )
 
@@ -968,12 +992,10 @@ code_fixer_agent = Agent(
     suite is FAILING. Fix ONLY the converted code — you do NOT edit the tests, and you
     fix ONLY the functions that are actually failing, one small batch at a time.
 
-    MANDATORY conversion conventions — the corrected code MUST follow these; never use
-    pandas (`pd.`, `.merge`, `.rename(columns=)`, `.iloc`, `df.apply`) or numpy (`np.`),
-    use native Spark DataFrame / `pyspark.sql.functions`:
-    <pyspark_conversion_conventions>
-    {pyspark_conventions}
-    </pyspark_conversion_conventions>
+    MANDATORY conversion conventions: use the **py2snow-skill** through the SkillToolset
+    for native Spark rules. Do not reproduce the full skill/reference corpus in context.
+    Never introduce pandas idioms (`pd.`, `.merge`, `.rename(columns=)`, `.iloc`, `df.apply`)
+    or numpy column-building patterns into the corrected code.
 
     Condensed pytest result — this lists only the FAILING tests and a short error for
     each (test `test_<function_name>` maps to the function `<function_name>`):
@@ -989,7 +1011,7 @@ code_fixer_agent = Agent(
     HOW TO WORK (surgical, batched — follow exactly):
     1. From <pytest_result>, list the FAILING functions (strip the `test_` prefix from
        each failing test name). If nothing is failing, make NO changes and stop.
-    2. Take the first few failing functions (up to ~8). Call **read_functions_tool** with
+    2. Take the first few failing functions (up to 4). Call **read_functions_tool** with
        exactly those names to get their CURRENT (converted) source, AND
        **read_source_functions_tool** with the same names to get the ORIGINAL Python
        source. Do NOT pull the whole file.
@@ -1032,7 +1054,7 @@ code_fixer_agent = Agent(
     ],
 
     mode="task",
-    output_key="pyspark_conversion_output",
+    output_key="code_fixer_output",
     before_agent_callback=seed_conventions,
 )
 
@@ -1047,12 +1069,10 @@ semantic_code_fixer_agent = Agent(
     NOT MATCH. Fix ONLY the converted PySpark code so its output equals the Python output,
     editing ONLY the functions responsible for the differences — surgically, in batches.
 
-    MANDATORY conversion conventions — the corrected code MUST follow these; never use
-    pandas (`pd.`, `.merge`, `.rename(columns=)`, `.iloc`, `df.apply`) or numpy (`np.`),
-    use native Spark DataFrame / `pyspark.sql.functions`:
-    <pyspark_conversion_conventions>
-    {pyspark_conventions}
-    </pyspark_conversion_conventions>
+    MANDATORY conversion conventions: use the **py2snow-skill** through the SkillToolset
+    for native Spark rules. Do not reproduce the full skill/reference corpus in context.
+    Never introduce pandas idioms (`pd.`, `.merge`, `.rename(columns=)`, `.iloc`, `df.apply`)
+    or numpy column-building patterns into the corrected code.
 
     Semantic comparison verdict (differences between the two outputs — these describe
     columns/values, so reason about WHICH function produces each differing column):
@@ -1105,6 +1125,6 @@ semantic_code_fixer_agent = Agent(
     ],
 
     mode="task",
-    output_key="pyspark_conversion_output",
+    output_key="semantic_code_fixer_output",
     before_agent_callback=seed_conventions,
 )
