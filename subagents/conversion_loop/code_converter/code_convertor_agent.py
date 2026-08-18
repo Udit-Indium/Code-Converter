@@ -363,44 +363,61 @@ def _source_text() -> str:
         return ""
 
 
-def read_source_index_tool(context: ToolContext) -> dict:
-    """Return a compact source overview without function bodies.
+def read_source_index_tool(context: ToolContext, want: str = "constants") -> dict:
+    """Source metadata WITHOUT function bodies. Ask for the part you need.
 
-    Normally the converter does not need this tool because the next batch is
-    already injected by _next_batch_source(). Use it only when metadata is
-    genuinely required.
+    Args:
+        want: `"constants"` (default) returns module constants with their exact
+            values — the reason this tool exists, since the case-fact checker
+            reports a mismatch as a bare NAME and the value lives nowhere else
+            the converter can reach. `"functions"` returns names and parameter
+            lists. `"all"` returns both, and costs roughly four times a
+            constants-only call.
+
+    Returning everything by default was waste on every call: a whole-file
+    function index is re-sent on each later turn that carries history, and the
+    converter almost never needs it — the next batch's full source is injected
+    into the prompt, and progress comes back from
+    add_converted_functions_tool. The constants are the part it genuinely
+    cannot get any other way.
     """
-    src = _source_text()
-    if not src.strip():
-        return {"available": False, "count": 0, "functions": [],
-                "error": "source script not found"}
-    try:
-        tree = ast.parse(src)
-    except SyntaxError as exc:
-        return {"available": False, "count": 0, "functions": [],
-                "error": f"source has a syntax error: {exc}"}
+    want = (want or "constants").strip().lower()
+    if want not in ("constants", "functions", "all"):
+        return {"available": False,
+                "error": f"want must be 'constants', 'functions' or 'all', not {want!r}"}
 
-    functions = []
-    for node in tree.body:
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            continue
-        entry = {"name": node.name, "kind": type(node).__name__}
-        if not isinstance(node, ast.ClassDef):
-            entry["parameters"] = [arg.arg for arg in node.args.args]
-        functions.append(entry)
+    out: dict = {"available": True}
 
-    return {
-        "available": True,
-        "count": len(functions),
-        "functions": functions,
-        # Values, not just names. The case-fact checker reports a constant
-        # mismatch as a bare NAME, so if this tool also returned only names the
-        # converter had no way at all to learn the value it was supposed to
-        # write — it would burn its turn hunting for the raw source through the
-        # skill tools and then guess. The parser already stores the literal
-        # values in the inventory; hand them over.
-        "constants": _source_constants(),
-    }
+    if want in ("constants", "all"):
+        out["constants"] = _source_constants()
+
+    if want in ("functions", "all"):
+        src = _source_text()
+        if not src.strip():
+            return {"available": False, "count": 0, "functions": [],
+                    "error": "source script not found"}
+        try:
+            tree = ast.parse(src)
+        except SyntaxError as exc:
+            return {"available": False, "count": 0, "functions": [],
+                    "error": f"source has a syntax error: {exc}"}
+
+        functions = []
+        for node in tree.body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            # `kind` is only worth the bytes when it is NOT the ordinary case.
+            entry = {"name": node.name}
+            if isinstance(node, ast.ClassDef):
+                entry["kind"] = "ClassDef"
+            else:
+                entry["parameters"] = [arg.arg for arg in node.args.args]
+            functions.append(entry)
+
+        out["count"] = len(functions)
+        out["functions"] = functions
+
+    return out
 
 
 def _source_constants() -> dict:
@@ -435,7 +452,7 @@ def read_migration_progress_tool(context: ToolContext) -> dict:
             "converted_count": progress.get("converted_count", 0),
             "remaining_count": progress.get("remaining_count", 0),
             "percent_complete": progress.get("percent_complete", 0.0),
-            "remaining_sample": (progress.get("remaining") or [])[:20],
+            "remaining_sample": (progress.get("remaining") or [])[:5],
             "extra_in_output_count": len(progress.get("extra_in_output") or []),
             "output_file": progress.get("output_file"),
         }
@@ -443,7 +460,7 @@ def read_migration_progress_tool(context: ToolContext) -> dict:
         source = _source_function_names()
         return {"source_function_count": len(source), "converted_count": 0,
                 "remaining_count": len(source), "percent_complete": 0.0,
-                "remaining_sample": source[:20], "extra_in_output_count": 0,
+                "remaining_sample": source[:5], "extra_in_output_count": 0,
                 "output_file": context.state.get("converted_pyspark_file_path")}
 
 
@@ -534,15 +551,21 @@ def add_converted_functions_tool(context: ToolContext, functions_code: str) -> d
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
     progress = _write_progress(context.state, total)
+    # Every field here is re-sent on each later turn that carries history, so
+    # this dict pays its size many times over. It keeps only what changes the
+    # model's next action: what landed, and how much is left. Dropped as dead
+    # weight: `saved_file_path` (identical on every call, and already in
+    # state), `percent_complete` (derivable from the two counts), and the
+    # 20-name `remaining_sample` — the next batch's actual source is injected
+    # into the prompt each iteration, so a long name list steers nothing. A
+    # short sample stays, because "0 remaining" and "3 remaining" read very
+    # differently when the model decides whether to stop.
     result = {
         "status": "success",
-        "saved_file_path": str(p),
         "functions_added_this_batch": added,
         "converted_count": progress["converted_count"],
         "remaining_count": progress["remaining_count"],
-        "percent_complete": progress["percent_complete"],
-        "remaining_sample": progress["remaining"][:20],
-        "remaining_truncated": len(progress["remaining"]) > 20,
+        "remaining_sample": progress["remaining"][:5],
     }
 
     # Deterministic check of the rule the conventions repeat hardest. Reported
@@ -1041,8 +1064,10 @@ code_convertor_agent = Agent(
     Other tools, only if you actually need them (each call costs a full round-trip):
       * **read_source_functions_tool(function_names=[...])** — ONLY if a body is
         missing from the supplied batch or you genuinely need to re-check it.
-      * **read_source_index_tool()** — ONLY if you need metadata such as parameters
-        or module constants that is not available from the current batch.
+      * **read_source_index_tool(want=...)** — `want="constants"` (the default)
+        for module constants and their exact values; `want="functions"` for
+        names and parameters; `want="all"` for both, which is ~4x the size.
+        Ask for the smallest part that answers your question.
       * **read_migration_progress_tool()** — ONLY if progress is unclear.
       * **read_converted_file_tool()** — ONLY if you need output function names.
       * Do NOT repeatedly call a tool for information already present in this turn.
@@ -1078,11 +1103,12 @@ code_convertor_agent = Agent(
        times as the batch needs. On the FIRST batch also include: the needed `import` lines (pyspark
        imports, etc.) AND every module-level constant from the source with its EXACT value
        (`constant_value_mismatch` names the constants that are wrong;
-       read_source_index_tool returns every constant name WITH its exact value —
+       read_source_index_tool() returns every constant name WITH its exact value —
        that tool is the only place the values come from, so use it instead of
        hunting for the raw source through the skill).
        Do NOT resend functions already in the file — the tool merges and de-dupes by name;
-       it returns `converted_count`, `remaining_count`, and a small `remaining_sample`; use the count as the authoritative progress signal.
+       it returns `converted_count` and `remaining_count` — use `remaining_count` as
+       the authoritative progress signal, not the short `remaining_sample`.
     4. STOP your turn as soon as the batch is appended. The loop re-invokes you with a freshly computed next batch; keep going batch by batch until `remaining_count` is 0.
     5. ONLY when `remaining_count` comes back 0 — the final batch — call
        **execute_pyspark_script_tool** once as a whole-file check. Do NOT run it after
