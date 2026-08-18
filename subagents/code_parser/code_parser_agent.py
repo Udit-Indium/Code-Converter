@@ -354,10 +354,15 @@ def ast_parser(context: ToolContext, script_path: str)-> dict[str, str]:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     try:
         result = run_parser(script_path, follow_imports=True, output_dir=str(OUTPUT_DIR))
-        with open(script_path, "r") as file:
+        # encoding is explicit on every read: `open()` otherwise uses the
+        # platform default, which is UTF-8 on macOS/Linux but cp1252 on
+        # Windows. A notebook containing a smart quote or an em-dash then dies
+        # with "'charmap' codec can't decode byte 0x9d", and only on Windows —
+        # the same file parses cleanly everywhere else.
+        with open(script_path, "r", encoding="utf-8") as file:
             python_content = file.read()
 
-        with open(result["json_file"], "r") as file:
+        with open(result["json_file"], "r", encoding="utf-8") as file:
             ast_parsed_content = json.load(file)
 
         # Two canonical copies so consumers need no knowledge of the original

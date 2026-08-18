@@ -886,7 +886,9 @@ def execute_pyspark_script_tool(context: ToolContext) -> dict:
     # Read before the try block, so guard it separately: an unreadable file here
     # would otherwise escape as an exception instead of a tool result.
     try:
-        with open(python_script_path, "r") as file:
+        # Explicit encoding: the platform default is cp1252 on Windows, which
+        # cannot read the non-ASCII characters a converted file may carry.
+        with open(python_script_path, "r", encoding="utf-8") as file:
             code = file.read()
     except OSError as exc:
         return {
