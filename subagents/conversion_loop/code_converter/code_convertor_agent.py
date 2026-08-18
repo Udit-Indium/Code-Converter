@@ -447,6 +447,48 @@ def read_migration_progress_tool(context: ToolContext) -> dict:
                 "output_file": context.state.get("converted_pyspark_file_path")}
 
 
+def _parsable_prefix(snippet: str) -> tuple[str, str]:
+    """Split `snippet` into the longest parsable prefix and the broken tail.
+
+    Exists because a MAX_TOKENS cutoff truncates the model mid-function, and the
+    old behaviour threw the WHOLE batch away for it: three complete conversions
+    plus one half-written one parsed as a SyntaxError, the tool rejected all
+    four, and the loop re-converted the lot on the next turn — burning the same
+    output budget and usually truncating in the same place. Since the cut is
+    always at the END, everything before the last complete top-level construct
+    is good code that has already been paid for.
+
+    Cut points are the starts of top-level constructs (column 0, non-blank), so
+    a prefix never ends inside a function body.
+
+    Returns:
+        `(parsable, dropped)`. `parsable` is `""` when nothing survives — a
+        snippet broken from its first line, which is a real syntax error rather
+        than a truncation.
+    """
+    try:
+        ast.parse(snippet)
+        return snippet, ""
+    except SyntaxError:
+        pass
+
+    lines = snippet.splitlines(keepends=True)
+    starts = [
+        i for i, line in enumerate(lines)
+        if line.strip() and not line[:1].isspace()
+    ]
+    for cut in reversed(starts):
+        prefix = "".join(lines[:cut])
+        if not prefix.strip():
+            continue
+        try:
+            ast.parse(prefix)
+            return prefix, "".join(lines[cut:])
+        except SyntaxError:
+            continue
+    return "", snippet
+
+
 def add_converted_functions_tool(context: ToolContext, functions_code: str) -> dict:
     """Append a BATCH of newly-converted PySpark code to the single output file.
 
@@ -459,14 +501,29 @@ def add_converted_functions_tool(context: ToolContext, functions_code: str) -> d
     p = _canonical_output_path(context.state)
     p.parent.mkdir(parents=True, exist_ok=True)
     existing = p.read_text(encoding="utf-8") if p.exists() else ""
+    dropped = ""
     try:
         merged, added = _merge_snippet(existing, functions_code)
     except SyntaxError as exc:
-        return {
-            "status": "error",
-            "error": f"The submitted functions_code has a syntax error: {exc}. "
-                     "Fix it and resubmit only that batch.",
-        }
+        # Probably a MAX_TOKENS truncation rather than a bad conversion. Keep
+        # the complete functions instead of discarding the batch; the loop's
+        # work-list is derived from what is on disk, so whatever was cut simply
+        # comes back in the next batch.
+        salvaged, dropped = _parsable_prefix(functions_code)
+        if not salvaged.strip():
+            return {
+                "status": "error",
+                "error": f"The submitted functions_code has a syntax error: {exc}. "
+                         "Fix it and resubmit only that batch.",
+            }
+        try:
+            merged, added = _merge_snippet(existing, salvaged)
+        except SyntaxError as exc2:
+            return {
+                "status": "error",
+                "error": f"The submitted functions_code has a syntax error: {exc2}. "
+                         "Fix it and resubmit only that batch.",
+            }
     p.write_text(merged, encoding="utf-8")
 
     # Refresh the progress file, and report the SHORT form back — counts and
@@ -493,13 +550,36 @@ def add_converted_functions_tool(context: ToolContext, functions_code: str) -> d
     # the visualisation conventions, so a hard block would refuse correct
     # plotting conversions. The batch is already saved; this tells the model
     # exactly what to fix with replace_functions_tool.
+    if dropped:
+        # Reported, not raised: the complete functions are already saved, and
+        # the next work-list is derived from the file on disk, so the model
+        # must NOT resend them.
+        result["status"] = "partial"
+        result["truncated"] = True
+        result["truncated_tail_chars"] = len(dropped)
+        result["action_required"] = (
+            "Your submission was cut off mid-function — you hit the output "
+            "token limit. The COMPLETE functions in it were saved; the "
+            "incomplete tail was discarded. Do NOT resend what was saved. "
+            "Convert fewer functions per call: submit one or two at a time "
+            "with add_converted_functions_tool, using several calls, rather "
+            "than building one large submission. `remaining_sample` below is "
+            "authoritative for what is still outstanding."
+        )
+
     violations = _pandas_violations(functions_code)
     if violations:
         result["pandas_violations"] = violations
-        result["action_required"] = (
+        pandas_note = (
             "This batch uses pandas idioms that must be native Spark. Fix them "
             "with replace_functions_tool before moving on. If a `.toPandas()` is "
             "a deliberate small-aggregate collect for plotting, say so and keep it."
+        )
+        # Append rather than assign: a truncated batch can ALSO contain pandas
+        # idioms, and overwriting would hide whichever notice was set first.
+        result["action_required"] = (
+            f"{result['action_required']} {pandas_note}"
+            if result.get("action_required") else pandas_note
         )
     return result
 
@@ -609,7 +689,20 @@ def read_converted_file_tool(context: ToolContext) -> dict:
 
 
 
+#: Hard ceiling on functions per batch.
 BATCH_SIZE = 4
+
+#: Ceiling on the SOURCE characters in one batch, which is the real constraint.
+#: A batch is capped by whichever limit binds first.
+#:
+#: A fixed count alone is the wrong unit and it broke: BATCH_SIZE was tuned when
+#: the refactor stage emitted ~4-statement functions, then the refactor moved to
+#: coarser blocks with a median of ~13, so "4 functions" silently became roughly
+#: three times the output and the converter started hitting MAX_TOKENS
+#: mid-submission. Converted PySpark runs longer than the Python it came from
+#: (typed signature, docstring, explicit column expressions), so the budget is
+#: well under the output cap rather than close to it.
+BATCH_CHAR_BUDGET = 2500
 
 
 def _next_batch_source(state) -> str:
@@ -638,7 +731,6 @@ def _next_batch_source(state) -> str:
     missing = [name for name in source_names if name not in converted_names]
     if not missing:
         return "(nothing left to convert)"
-    batch = missing[:BATCH_SIZE]
     src = _source_text()
     if not src.strip():
         return "(source unavailable — use read_source_functions_tool)"
@@ -651,6 +743,19 @@ def _next_batch_source(state) -> str:
         for n in tree.body
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
     }
+    # Fill the batch by size, not just by count: one long function is a whole
+    # batch, several short ones can share. The first function is always taken
+    # even if it alone busts the budget, otherwise an oversized function would
+    # never be offered and the loop would spin on it forever.
+    batch: list[str] = []
+    used = 0
+    for name in missing[:BATCH_SIZE]:
+        body = by_name.get(name) or ""
+        if batch and used + len(body) > BATCH_CHAR_BUDGET:
+            break
+        batch.append(name)
+        used += len(body)
+
     parts = [by_name[n] for n in batch if by_name.get(n)]
     missing_bodies = [n for n in batch if not by_name.get(n)]
     out = "\n\n".join(parts)
@@ -960,11 +1065,17 @@ code_convertor_agent = Agent(
        implementations: ABSOLUTELY NO placeholder comments (never write
        "# continue similarly", "# add remaining functions", "# TODO", "...", or an
        empty/`pass` body). A stubbed function does not count as converted and will
-       just come back in the next work-list. If a batch is too long to finish inside
-       your ~8k output limit, convert as many as fit and submit those — the rest
-       return in the next work-list.
-    3. Call **add_converted_functions_tool(functions_code=...)** passing ONLY this batch's
-       new functions. On the FIRST batch also include: the needed `import` lines (pyspark
+       just come back in the next work-list. Your output limit is ~4k tokens for
+       the WHOLE turn, including the tool call itself, so a batch of two or
+       three real functions can exceed it. Submit as you go — call
+       add_converted_functions_tool with one or two functions, then call it
+       again for the next one or two — rather than converting everything and
+       submitting once. Several small calls always beat one that gets cut off.
+       If you are cut off anyway, the complete functions you sent are saved and
+       reported back; do NOT resend them.
+    3. Call **add_converted_functions_tool(functions_code=...)** passing ONLY the
+       functions you just converted — one or two per call, calling it as many
+       times as the batch needs. On the FIRST batch also include: the needed `import` lines (pyspark
        imports, etc.) AND every module-level constant from the source with its EXACT value
        (`constant_value_mismatch` names the constants that are wrong;
        read_source_index_tool returns every constant name WITH its exact value —
