@@ -17,7 +17,7 @@ Two inputs, three jobs:
 
 ---
 
-## 0. The four hard rules (non-negotiable)
+## 0. The five hard rules (non-negotiable)
 
 1. **Convert EVERY constants, function and EVERY class — no exceptions, no placeholders.**
    The converted constant counts and callable count must **equal** the parsed-JSON inventory. 
@@ -37,6 +37,30 @@ Two inputs, three jobs:
    transform, **no plain `F.udf`** unless there is truly no built-in. Every
    column name, join key, group key, filter literal and window spec comes from
    the **parsed JSON + source, used verbatim** — never invented or renamed.
+
+5. **Never emit a library that needs a desktop application.** `xlwings`,
+   `win32com`, `pywin32` and `xlsxwriter` drive a local Excel/Windows process
+   over COM. They import fine on a developer laptop and can **never** import on
+   a Databricks cluster — there is no Excel installation and no desktop session,
+   and no amount of re-running or `%pip install` fixes that. Convert Excel work
+   to **pandas + openpyxl**:
+
+   | Source (`xlwings`) | Converted (pandas + openpyxl) |
+   |---|---|
+   | `xw.Book(path)` / `wb.sheets[name]` | `pandas.read_excel(path, sheet_name=name)` |
+   | `sheet.range("A1").options(pd.DataFrame).value` | `pandas.read_excel(path, sheet_name=name, usecols=..., skiprows=...)` |
+   | `sheet.range("A1").value = df` | `df.to_excel(path, sheet_name=name, index=False)` |
+   | appending to an existing workbook | `pandas.ExcelWriter(path, engine="openpyxl", mode="a")` |
+   | cell formatting / formulas | `openpyxl.load_workbook(path)` then the `openpyxl` API |
+
+   Keep the source's file paths, sheet names, header rows and cell ranges
+   **verbatim** — the mapping changes the library, never the data.
+
+   This is the one place a `pandas` call is **correct** rather than a violation:
+   Excel I/O is driver-side file work, not a distributed transform. Read the
+   sheet with pandas, then hand it to `spark.createDataFrame(...)` and do the
+   actual transformation in Spark; collect a **small** aggregate back before
+   writing. Never pull a full distributed frame to the driver just to write it.
 
 ---
 

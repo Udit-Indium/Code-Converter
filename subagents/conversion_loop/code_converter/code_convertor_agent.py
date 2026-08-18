@@ -58,6 +58,45 @@ def _error_summary(stderr: "str | None", file_path: str, limit: int = 400) -> st
     return summary[:limit]
 
 
+#: Modules that do not exist on a Databricks cluster, and what to use instead.
+#: xlwings is the one that actually bit: it drives a local Excel installation
+#: over COM, so it imports fine on a developer laptop and can never work on a
+#: cluster — there is no Excel process and no desktop session to automate.
+#: Retrying the run cannot fix a missing desktop application, so the loop has
+#: to stop and rewrite the function rather than treat it as a flaky failure.
+UNAVAILABLE_ON_DATABRICKS = {
+    "xlwings": "pandas + openpyxl",
+    "win32com": "pandas + openpyxl",
+    "pywin32": "pandas + openpyxl",
+    "xlsxwriter": "pandas + openpyxl",
+    "pyautogui": "a headless equivalent",
+}
+
+_MODULE_NOT_FOUND = re.compile(
+    r"(?:ModuleNotFoundError|ImportError).*?['\"]([A-Za-z_][A-Za-z0-9_.]*)['\"]"
+)
+
+
+def _unavailable_module(text: str) -> str:
+    """Return the unavailable module named in `text`, or "".
+
+    Matches on the import error the cluster raises, not on the source, so it
+    fires for a transitive import too.
+    """
+    if not text:
+        return ""
+    for match in _MODULE_NOT_FOUND.finditer(text):
+        root = match.group(1).split(".")[0]
+        if root in UNAVAILABLE_ON_DATABRICKS:
+            return root
+    # Fall back to a bare mention: some Databricks errors omit the quotes.
+    lowered = text.lower()
+    for name in UNAVAILABLE_ON_DATABRICKS:
+        if name in lowered and ("modulenotfound" in lowered or "no module named" in lowered):
+            return name
+    return ""
+
+
 def _as_dict(value):
     """Tolerate an inventory that is already a dict, or is raw JSON text."""
     if isinstance(value, str):
@@ -72,6 +111,10 @@ AST_INVENTORY = OUTPUTS_DIR / "ast_inventory.json"
 # Cap on a single constant's string value in read_source_index_tool, so one
 # embedded SQL blob cannot crowd out every other constant in the response.
 MAX_CONSTANT_VALUE_CHARS = 500
+
+#: pandas Excel I/O that hard rule 5 REQUIRES (xlwings cannot run on a cluster).
+#: Excluded from the pandas-violation scan so the two rules do not contradict.
+EXCEL_IO_NAMES = {"read_excel", "to_excel", "ExcelWriter", "ExcelFile"}
 
 
 def _inventory() -> dict:
@@ -150,6 +193,11 @@ def _pandas_violations(src: str) -> list[str]:
     functions are required to build rows in plain Python (with seeded numpy /
     random) and hand them to spark.createDataFrame — banning it would reject
     correct conversions.
+
+    Also flags imports that cannot exist on a Databricks cluster
+    (UNAVAILABLE_ON_DATABRICKS). Catching those here rather than at run time
+    saves a full Databricks round-trip on a failure that is guaranteed and
+    unfixable by retrying.
     """
     try:
         tree = ast.parse(src)
@@ -157,32 +205,64 @@ def _pandas_violations(src: str) -> list[str]:
         return []          # the caller reports the syntax error itself
 
     found: list[str] = []
+    pandas_imports: list[str] = []
+    non_excel_pandas = False
     for node in ast.walk(tree):
         # import pandas / from pandas import ...
         if isinstance(node, ast.Import):
             for a in node.names:
-                if a.name.split(".")[0] == "pandas":
-                    found.append(f"line {node.lineno}: `import pandas` — use the Spark DataFrame API")
+                root = a.name.split(".")[0]
+                if root == "pandas":
+                    pandas_imports.append(
+                        f"line {node.lineno}: `import pandas` — use the Spark DataFrame API"
+                    )
+                elif root in UNAVAILABLE_ON_DATABRICKS:
+                    found.append(
+                        f"line {node.lineno}: `import {root}` — not available on "
+                        f"Databricks; use {UNAVAILABLE_ON_DATABRICKS[root]}"
+                    )
         elif isinstance(node, ast.ImportFrom):
-            if (node.module or "").split(".")[0] == "pandas":
-                found.append(f"line {node.lineno}: `from pandas import …` — use the Spark DataFrame API")
+            root = (node.module or "").split(".")[0]
+            if root == "pandas":
+                pandas_imports.append(
+                    f"line {node.lineno}: `from pandas import …` — use the Spark DataFrame API"
+                )
+            elif root in UNAVAILABLE_ON_DATABRICKS:
+                found.append(
+                    f"line {node.lineno}: `from {root} import …` — not available on "
+                    f"Databricks; use {UNAVAILABLE_ON_DATABRICKS[root]}"
+                )
 
         elif isinstance(node, ast.Attribute):
-            # pd.<anything>
+            # pd.<anything>, except the Excel I/O that hard rule 5 REQUIRES
             if isinstance(node.value, ast.Name) and node.value.id in ("pd", "pandas"):
-                found.append(f"line {node.lineno}: `{node.value.id}.{node.attr}` — pandas call, convert to Spark")
+                if node.attr not in EXCEL_IO_NAMES:
+                    non_excel_pandas = True
+                    found.append(f"line {node.lineno}: `{node.value.id}.{node.attr}` — pandas call, convert to Spark")
             # .iloc / .loc positional indexing
             elif node.attr in ("iloc", "loc"):
+                non_excel_pandas = True
                 found.append(f"line {node.lineno}: `.{node.attr}` — no positional indexing in Spark; use filter/select")
 
         elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
             name = node.func.attr
+            if name in EXCEL_IO_NAMES:
+                continue
+            non_excel_pandas = True
             if name == "merge":
                 found.append(f"line {node.lineno}: `.merge(...)` — use `.join(other, on=…, how=…)`")
             elif name == "toPandas":
                 found.append(f"line {node.lineno}: `.toPandas()` — collapses the frame to the driver")
             elif name == "rename" and any(k.arg == "columns" for k in node.keywords):
                 found.append(f"line {node.lineno}: `.rename(columns=…)` — use `.withColumnRenamed(old, new)`")
+
+    # A pandas import is only a violation when pandas is used for something
+    # other than Excel I/O. Hard rule 5 requires pandas + openpyxl for reading
+    # and writing workbooks (xlwings cannot run on a cluster), so flagging the
+    # import there would tell the converter to undo the very fix the rule asks
+    # for — the two checks would fight and the loop would never settle.
+    if pandas_imports and non_excel_pandas:
+        found = pandas_imports + found
 
     # de-dupe, keep order
     return list(dict.fromkeys(found))
@@ -1004,6 +1084,26 @@ def execute_pyspark_script_tool(context: ToolContext) -> dict:
             trace = output.get("error_trace") or ""
             out["error"] = _tail(error_text)
             out["error_summary"] = _error_summary(trace or error_text, python_script_path)
+            missing = _unavailable_module(f"{trace}\n{error_text}")
+            if missing:
+                # Terminal, not flaky: re-running cannot install a desktop
+                # application onto a cluster. Say so explicitly, because the
+                # generic "read error_summary and fix the broken piece"
+                # instruction otherwise reads as "retry the same code".
+                out["fatal"] = True
+                out["unavailable_module"] = missing
+                out["action_required"] = (
+                    f"`{missing}` does not exist on Databricks and never will — "
+                    f"it drives a local desktop application, so no cluster can "
+                    f"import it. DO NOT re-run this script and DO NOT retry the "
+                    f"import. Rewrite the offending function(s) now with "
+                    f"{UNAVAILABLE_ON_DATABRICKS[missing]} using "
+                    f"replace_functions_tool, then run once more. Excel reads "
+                    f"become `pandas.read_excel(path, sheet_name=...)`; writes "
+                    f"become `pandas.DataFrame.to_excel(path, sheet_name=..., "
+                    f"index=False)` or an `openpyxl` workbook. Keep the same "
+                    f"file paths, sheet names, and cell ranges as the source."
+                )
         return out
 
     except Exception as exc:
@@ -1117,12 +1217,23 @@ code_convertor_agent = Agent(
        every batch: the converted file is a function library, so running it only
        proves the file imports, and each run costs a full round-trip. If it reports
        success=false, read `error_summary` and fix just the broken piece.
+       If the result has `fatal: true` and an `unavailable_module`, STOP re-running:
+       that module cannot exist on a Databricks cluster, so the same run will fail
+       forever. Do exactly what `action_required` says — rewrite those functions with
+       the named replacement, then run once more.
 
     **STRICT RULES**
     - Do not change the underlying logic of the functions.
     - Do not infer/rename columns — use the source script column names.
     - Do not change constant values; include every source constant with its correct value,
       and do NOT invent constants that are not in the source.
+    - NEVER emit `xlwings` (or `win32com`/`pywin32`/`xlsxwriter`). They drive a local
+      Excel/desktop application over COM and cannot run on a Databricks cluster. Convert
+      Excel work to `pandas` + `openpyxl`: `pandas.read_excel(path, sheet_name=...)` to
+      read, `DataFrame.to_excel(path, sheet_name=..., index=False)` or an `openpyxl`
+      workbook to write. Keep the source's file paths, sheet names, and cell ranges
+      exactly. This is the one place a pandas call is CORRECT rather than a violation —
+      Excel I/O is driver-side file work, not a distributed transform.
     - Convert same-named functions (the PySpark function name must equal the source name).
     - Convert EVERY source function, including the orchestrator (e.g. `run_all`) — it is a
       normal function. Do NOT invent helpers that are not in the source (the conventions
