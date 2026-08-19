@@ -1,12 +1,36 @@
+"""Parity-test stage: write a pytest suite, run it, repair what fails.
+
+One definition, two entry points.
+
+  * In the pipeline — `build_parity_loop()` is appended to the orchestrator's
+    sub_agents (after SEMS). This is the automatic path.
+  * On its own — `app` / `root_agent`, for re-checking a module without
+    re-converting it. Discovery is by directory, and this package now lives
+    inside subagents/, so the standalone launch is:
+
+        cd <repo>/subagents && adk web        # then pick "parity_app"
+
+Either way the target resolves the same: `converted_pyspark_file_path` from
+state when the pipeline set it, else the newest `*_spark.py` in outputs/,
+overridable with PARITY_TARGET_FILE.
+
+A failing suite is repaired, not just reported: write tests -> run -> fix the
+converted module -> re-test, stopping when every function has a test and the
+suite is green. The fixer edits the converted PySpark only, never the tests —
+a correct test that fails is the signal the conversion is wrong.
+
+An unchanged module skips the whole stage; see `_already_passed` in agent.py.
+"""
+
 from __future__ import annotations
 from google.adk.agents import LoopAgent
 from google.adk.apps import App
 from google.adk.apps.app import EventsCompactionConfig
 from .agent import build_parity_agent
-try:
-    from ..subagents.conversion_loop.code_converter import build_code_fixer_agent
-except ImportError:
-    from subagents.conversion_loop.code_converter import build_code_fixer_agent
+# The fixer lives with the converter because it uses the converter's tools
+# (replace_functions_tool, execute_pyspark_script_tool, the conventions skill)
+# to edit the module in place.
+from ..conversion_loop.code_converter import build_code_fixer_agent
 
 MAX_ITERATIONS = 12
 

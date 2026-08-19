@@ -7,7 +7,7 @@ from .subagents.conversion_loop import (
     conversion_loop_agent,
     semantic_validation_loop_agent,
 )
-from .parity_app import build_parity_loop
+from .subagents.parity_app import build_parity_loop
 
 
 root_agent = SequentialAgent(

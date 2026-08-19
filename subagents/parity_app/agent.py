@@ -12,13 +12,18 @@ from google.adk.agents.callback_context import CallbackContext
 from google.adk.models.lite_llm import LiteLlm
 from google.adk.tools.tool_context import ToolContext
 from dotenv import load_dotenv
-try:
-    from ..subagents.conversion_loop.case_fact_validation_agent.tools import run_parser
-except ImportError:
-    from subagents.conversion_loop.case_fact_validation_agent.tools import run_parser
+# Reuses the PySpark AST parser that already ships with the case-fact checker
+# rather than vendoring a second 1,471-line copy that would drift.
+#
+# This resolves from INSIDE subagents, which is why it is a plain relative
+# import again: `..` here means `subagents`, a package that is always fully
+# imported before this module loads. The same import spelled from a package at
+# the repo root failed with "attempted relative import beyond top-level
+# package" — living next to its dependency is what makes the simple form safe.
+from ..conversion_loop.case_fact_validation_agent.tools import run_parser
 load_dotenv()
 
-OUTPUTS_DIR = pathlib.Path(__file__).parents[1] / "outputs"
+OUTPUTS_DIR = pathlib.Path(__file__).parents[2] / "outputs"
 PYTEST_FILENAME = "pyspark_pytest.py"
 
 HOST = os.environ["DATABRICKS_HOST"]
