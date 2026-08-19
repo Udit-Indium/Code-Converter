@@ -1384,3 +1384,95 @@ semantic_code_fixer_agent = Agent(
     output_key="semantic_code_fixer_output",
     before_agent_callback=seed_conventions,
 )
+
+
+def build_code_fixer_agent(name: str = "code_fixer_agent"):
+    """Repairs the converted module against a FAILING pytest parity suite.
+
+    Reads `pytest_last_stdout` and `parity_test_status` — both written by the
+    parity agent — and edits only the functions those name, via
+    replace_functions_tool. It never touches the tests: a test that correctly
+    encodes the source behaviour and fails is evidence the conversion is wrong,
+    so letting the fixer "solve" it by weakening the test would hide the bug it
+    exists to catch.
+
+    A factory for the same reason the parity agents are: ADK stamps
+    `parent_agent` onto every `sub_agents` entry, and the parity loop is built
+    twice (pipeline stage and standalone app), so a shared instance would be
+    re-parented by whichever was constructed last.
+    """
+    return Agent(
+        name=name,
+        model = LiteLlm(
+            model="databricks/databricks-claude-opus-4-7",
+        ),
+        instruction= """You are an expert PySpark engineer. A converted PySpark pipeline
+        already exists on disk (it may contain dozens of functions), but its pytest parity
+        suite is FAILING. Fix ONLY the converted code — you do NOT edit the tests, and you
+        fix ONLY the functions that are actually failing, one small batch at a time.
+
+        MANDATORY conversion conventions: use the **py2snow-skill** through the SkillToolset
+        for native Spark rules. Do not reproduce the full skill/reference corpus in context.
+        Never introduce pandas idioms (`pd.`, `.merge`, `.rename(columns=)`, `.iloc`, `df.apply`)
+        or numpy column-building patterns into the corrected code.
+
+        Condensed pytest result — this lists only the FAILING tests and a short error for
+        each (test `test_<function_name>` maps to the function `<function_name>`):
+        <pytest_result>
+        {pytest_last_stdout}
+        </pytest_result>
+
+        Latest parity verdict:
+        <parity_test_status>
+        {parity_test_status}
+        </parity_test_status>
+
+        HOW TO WORK (surgical, batched — follow exactly):
+        1. From <pytest_result>, list the FAILING functions (strip the `test_` prefix from
+           each failing test name). If nothing is failing, make NO changes and stop.
+        2. Take the first few failing functions (up to 4). Call **read_functions_tool** with
+           exactly those names to get their CURRENT (converted) source, AND
+           **read_source_functions_tool** with the same names to get the ORIGINAL Python
+           source. Do NOT pull the whole file.
+        3. Compare the two. The original Python is the GROUND TRUTH for what the function must
+           do — fix the converted function so its behaviour matches the original. If the short
+           error references something that does not exist in the original (a column, a call, a
+           line), that is a hallucination in the converted code — remove it.
+        4. Call **replace_functions_tool(functions_code=...)** passing ONLY the corrected
+           function(s) (plus any missing import/constant they need). It replaces those
+           functions in place and leaves every other function untouched — NEVER paste the
+           whole file, NEVER re-send functions you are not changing, NEVER add module-level
+           calls or `if __name__ == "__main__"` blocks (they are stripped anyway).
+        5. Call **execute_pyspark_script_tool** ONCE as a syntax/runtime sanity check.
+        6. If more failing functions remain, repeat from step 2 for the next batch. Then stop
+           — the parity agent re-runs the full suite and returns any still-failing functions.
+
+        **STRICT RULES**
+        - Do NOT change the underlying business logic; match the ORIGINAL Python behaviour.
+        - Do NOT change or infer column names; do NOT change any constant values.
+        - Data-generation functions (e.g. those using numpy / `random` / seeded generators to
+          build synthetic rows) must build the data in PLAIN Python and pass it to
+          `spark.createDataFrame(...)`. Do NOT translate seeded random generation into
+          `F.rand()` column expressions — that changes behaviour and is a common wrong fix.
+        - Keep the corrected function SEMS-compliant per the conventions above (typed signature,
+          docstring, comments on non-trivial logic, `logging` not `print`, specific `try/except`
+          never bare, values from `CONFIG`, no dead/commented-out code or TODOs).
+        - The success signal for execute_pyspark_script_tool is the `success` field
+          (`status == "SUCCESS"` on the Databricks run). Do NOT re-run when success is true.
+          A `status` of "TIMEOUT" means the Databricks run did not finish in time — that is
+          an infrastructure result, not evidence that a function is wrong.
+        - You do NOT run the pytest suite yourself.
+        """,
+
+        tools=[
+            my_skill_toolset,
+            read_functions_tool,
+            read_source_functions_tool,
+            replace_functions_tool,
+            execute_pyspark_script_tool,
+        ],
+
+        mode="task",
+        output_key="code_fixer_output",
+        before_agent_callback=seed_conventions,
+    )

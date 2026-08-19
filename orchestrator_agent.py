@@ -7,6 +7,7 @@ from .subagents.conversion_loop import (
     conversion_loop_agent,
     semantic_validation_loop_agent,
 )
+from .parity_app import build_parity_loop
 
 
 root_agent = SequentialAgent(
@@ -15,14 +16,16 @@ root_agent = SequentialAgent(
         "Orchestrates the Python-to-PySpark conversion: parses the source script "
         "(restructuring a flat script into functions first, then building the AST "
         "inventory), runs the conversion loop that converts and fact-checks until "
-        "the case facts match, then runs the semantic-validation loop that compares "
+        "the case facts match, runs the semantic-validation loop that compares "
         "Python vs PySpark outputs on a dummy dataset and fixes the converted code "
-        "until they match."
+        "until they match, then writes and runs a pytest parity suite over the "
+        "converted module and reports coverage and pass/fail."
     ),
     sub_agents=[
         code_parser_agent,
         conversion_loop_agent,
         semantic_validation_loop_agent,
+        build_parity_loop("parity_test_agent"),
     ],
 )
 
