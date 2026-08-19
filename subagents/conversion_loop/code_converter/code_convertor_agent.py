@@ -57,13 +57,6 @@ def _error_summary(stderr: "str | None", file_path: str, limit: int = 400) -> st
     summary = (f"Crashed at{where}. {exc}").strip()
     return summary[:limit]
 
-
-#: Modules that do not exist on a Databricks cluster, and what to use instead.
-#: xlwings is the one that actually bit: it drives a local Excel installation
-#: over COM, so it imports fine on a developer laptop and can never work on a
-#: cluster — there is no Excel process and no desktop session to automate.
-#: Retrying the run cannot fix a missing desktop application, so the loop has
-#: to stop and rewrite the function rather than treat it as a flaky failure.
 UNAVAILABLE_ON_DATABRICKS = {
     "xlwings": "pandas + openpyxl",
     "win32com": "pandas + openpyxl",
@@ -107,13 +100,8 @@ def _as_dict(value):
     return value if isinstance(value, dict) else {}
 
 AST_INVENTORY = OUTPUTS_DIR / "ast_inventory.json"
-
-# Cap on a single constant's string value in read_source_index_tool, so one
-# embedded SQL blob cannot crowd out every other constant in the response.
 MAX_CONSTANT_VALUE_CHARS = 500
 
-#: pandas Excel I/O that hard rule 5 REQUIRES (xlwings cannot run on a cluster).
-#: Excluded from the pandas-violation scan so the two rules do not contradict.
 EXCEL_IO_NAMES = {"read_excel", "to_excel", "ExcelWriter", "ExcelFile"}
 
 
@@ -808,6 +796,37 @@ BATCH_SIZE = 4
 BATCH_CHAR_BUDGET = 2500
 
 
+def _missing_constants(state) -> dict:
+    """Source constants that are NOT yet in the converted file, with values.
+
+    The converter's instructions say to emit every module-level constant with
+    its exact value, but nothing was putting those values in front of it:
+    `_next_batch_source` collects function and class bodies only, and the
+    constants live at module level, so the model saw them only if it chose to
+    call read_source_index_tool on its own initiative. It usually did not — the
+    converted file came back with 0 of the source's 2 constants, and the
+    case-fact checker then failed the run for a value the model was never shown.
+
+    Values come from the inventory UNTRUNCATED: a shortened literal would be
+    wrong code, and a wrong constant is worse than a long prompt.
+
+    Recomputed against the file on disk each turn, so it is self-clearing —
+    once a constant is written it stops being injected, and if a batch is lost
+    it reappears without any state to go stale.
+    """
+    consts = _inventory().get("constants") or {}
+    if not isinstance(consts, dict) or not consts:
+        return {}
+    have: set[str] = set()
+    path = _canonical_output_path(state)
+    if path.exists():
+        try:
+            have = _module_const_names(ast.parse(path.read_text(encoding="utf-8")))
+        except (OSError, SyntaxError):
+            have = set()
+    return {name: consts[name] for name in sorted(consts) if name not in have}
+
+
 def _next_batch_source(state) -> str:
     """Source of the next BATCH_SIZE functions still to convert.
 
@@ -865,7 +884,23 @@ def _next_batch_source(state) -> str:
     if missing_bodies:
         out += ("\n\n# not found in the source: " + ", ".join(missing_bodies)
                 + " — fetch with read_source_functions_tool")
-    return out or "(no bodies found — use read_source_functions_tool)"
+    out = out or "(no bodies found — use read_source_functions_tool)"
+
+    # Prepend any constants still absent from the converted file. Injected
+    # rather than left to a tool call, because the model has to know the value
+    # to write it and cannot infer 0.908 from the name USD_2_EUR.
+    pending = _missing_constants(state)
+    if pending:
+        block = "\n".join(f"{name} = {value!r}" for name, value in pending.items())
+        out = (
+            "# MODULE-LEVEL CONSTANTS still missing from the converted file.\n"
+            "# Emit these VERBATIM at module level in this batch, exactly once,\n"
+            "# with these exact values. They are not optional and cannot be\n"
+            "# derived from anything else you can see.\n"
+            f"{block}\n\n"
+            + out
+        )
+    return out
 
 
 def _compact_case_fact_status(state) -> dict:
@@ -930,7 +965,14 @@ def seed_conventions(callback_context: CallbackContext) -> None:
     state = callback_context.state
     # Do not inject the complete SKILL.md/reference corpus into state.
     # The SkillToolset remains available to the fixer when it needs conventions.
-    state.pop("pyspark_conventions", None)
+    #
+    # Cleared by assignment, not `state.pop(...)`: ADK's State is dict-LIKE but
+    # does not implement the full mapping API, and `pop` raised
+    # `AttributeError: 'State' object has no attribute 'pop'` — which killed the
+    # semantic fixer before it ran, every time. Only `.get()` and `[]=` are
+    # relied on here; those are what the rest of this package uses.
+    if state.get("pyspark_conventions"):
+        state["pyspark_conventions"] = ""
     return None
 
 
@@ -1204,10 +1246,12 @@ code_convertor_agent = Agent(
        functions you just converted — one or two per call, calling it as many
        times as the batch needs. On the FIRST batch also include: the needed `import` lines (pyspark
        imports, etc.) AND every module-level constant from the source with its EXACT value
-       (`constant_value_mismatch` names the constants that are wrong;
-       read_source_index_tool() returns every constant name WITH its exact value —
-       that tool is the only place the values come from, so use it instead of
-       hunting for the raw source through the skill).
+       Any constant still missing is listed AT THE TOP of <batch_source> with its
+       exact value — copy those lines verbatim to module level; they are not
+       optional. The list shrinks as you write them, so an empty one means the
+       constants are done. `constant_value_mismatch` names constants whose value
+       is wrong; read_source_index_tool() can re-read all of them if you need to
+       check one.
        Do NOT resend functions already in the file — the tool merges and de-dupes by name;
        it returns `converted_count` and `remaining_count` — use `remaining_count` as
        the authoritative progress signal, not the short `remaining_sample`.

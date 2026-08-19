@@ -481,11 +481,14 @@ def load_semantic_inputs(callback_context: CallbackContext) -> None:
     state = callback_context.state
 
     DUMMY_DIR.mkdir(parents=True, exist_ok=True)
-    state.setdefault("semantic_match", {
-        "match": False,
-        "differences": [],
-        "message": "Semantic validation has not run yet.",
-    })
+    # `state.setdefault(...)` is the same trap as `state.pop(...)`: ADK's State
+    # does not implement the full mapping API. Spelled out with `.get()` + `[]=`.
+    if state.get("semantic_match") is None:
+        state["semantic_match"] = {
+            "match": False,
+            "differences": [],
+            "message": "Semantic validation has not run yet.",
+        }
 
     # The parser writes this canonical copy of whatever it actually parsed — the
     # refactored script when there is one. Read from the fixed path rather than
@@ -540,7 +543,8 @@ def load_semantic_inputs(callback_context: CallbackContext) -> None:
     state["semantic_dummy_dir"] = str(DUMMY_DIR)
     state["semantic_python_output_path"] = str(_outputs_path(PYTHON_OUTPUT))
     state["semantic_pyspark_output_path"] = str(_outputs_path(PYSPARK_OUTPUT))
-    state.setdefault("semantic_pyspark_runner_path", str(_outputs_path(PYSPARK_RUNNER)))
+    if state.get("semantic_pyspark_runner_path") is None:
+        state["semantic_pyspark_runner_path"] = str(_outputs_path(PYSPARK_RUNNER))
     return None
 
 
