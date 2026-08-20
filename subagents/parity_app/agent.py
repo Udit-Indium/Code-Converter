@@ -864,13 +864,17 @@ def add_pytest_tests_tool(context: ToolContext, tests_code: str) -> dict:
 #: validation. That is how a single request reached a 202,272-token prompt
 #: against a 200,000 ITPM quota.
 #:
-#: Left at "default" because it is unverified, not because it is wrong: if
-#: ADK's "none" also strips the CURRENT turn's own tool responses, the writer
-#: would submit a batch and never see the result. Everything is in place for it
-#: to work; flip PARITY_INCLUDE_CONTENTS=none to try it, and back if the writer
-#: stops making progress. The fixer keeps history either way — it reads its own
-#: tool results mid-turn and has no equivalent injection.
-PARITY_INCLUDE_CONTENTS = os.environ.get("PARITY_INCLUDE_CONTENTS", "default")
+#: Now the default. The remaining unknown is whether ADK's "none" also strips
+#: the CURRENT turn's own tool responses; if it does, a tool the writer must
+#: READ FROM stops working. That is why the rules are injected instead of
+#: fetched whenever this is "none" (see _instruction_for): read_rules_tool()
+#: would otherwise return rules the model never sees, and it would write tests
+#: without the counting rule or the Spark fixture rule.
+#:
+#: Set PARITY_INCLUDE_CONTENTS=default to revert if the writer stops making
+#: progress. The fixer keeps history either way — it reads its own tool results
+#: mid-turn and has no equivalent injection.
+PARITY_INCLUDE_CONTENTS = os.environ.get("PARITY_INCLUDE_CONTENTS", "none")
 
 #: Hard ceiling on functions per iteration.
 BATCH_SIZE = 8
@@ -1084,6 +1088,35 @@ def run_pytest_tool(context: ToolContext) -> dict:
 
 
 
+def _instruction_for(include_contents: str, base: str) -> str:
+    """The writer's instruction, with the rules inlined when history is off.
+
+    With history retained, read_rules_tool() is the cheaper route: the rules are
+    static, so fetching them once beats re-sending ~860 tokens every turn.
+
+    With `include_contents="none"` that inverts. A tool the model must READ FROM
+    only works if the response survives to the next model call, and that is the
+    exact behaviour "none" may remove — the model would call the tool, receive
+    the rules, and write its tests without ever having seen them. Injecting is
+    the only form that cannot fail that way.
+
+    The trade is small in the case that matters: with history off the whole
+    prompt is a few thousand tokens, so ~860 of rules is noise against the
+    ~176,000 of inherited session history it replaces.
+    """
+    if include_contents != "none":
+        return base
+    return (
+        base
+        + "\n\n        You do NOT see earlier turns, so the rules are inlined below "
+          "rather than\n        fetched — read_rules_tool() would hand you a response you "
+          "may not still\n        have when you write. These rules are binding.\n\n"
+        + "        <rules>\n"
+        + "\n".join("        " + line for line in _rules_text().splitlines())
+        + "\n        </rules>\n"
+    )
+
+
 def build_parity_agent(name: str = "parity_test_case_validation_agent"):
     """Construct a FRESH parity agent.
 
@@ -1099,7 +1132,7 @@ def build_parity_agent(name: str = "parity_test_case_validation_agent"):
         model=LiteLlm(
             model="databricks/databricks-claude-opus-4-7",
         ),
-        instruction="""You write pytest parity tests for a converted PySpark module.
+        instruction=_instruction_for(PARITY_INCLUDE_CONTENTS, """You write pytest parity tests for a converted PySpark module.
 
         The module is importable as: from {pyspark_module_name} import <function_name>
 
@@ -1136,7 +1169,7 @@ def build_parity_agent(name: str = "parity_test_case_validation_agent"):
           never resend a test that is already in the file.
         - run_pytest_tool(): run on Databricks; returns a structured result.
         - read_converted_index_tool(): signatures, if <current_batch> is not enough.
-        """,
+        """),
         tools=[
             read_converted_index_tool,
             read_converted_functions_tool,
