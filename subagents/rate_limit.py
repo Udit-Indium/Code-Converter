@@ -385,14 +385,14 @@ class EndpointLimiter:
         called out separately.
         """
         capacity = self.input_tokens.capacity
-        if prompt_tokens > self.input_tokens.rate:
+        if prompt_tokens > self.input_tokens.rate_per_minute:
             logger.error(
                 "RateLimiter | %s | prompt of %d tokens EXCEEDS the whole ITPM "
                 "quota of %.0f. No pacing can fit this request into a minute's "
                 "budget — shrink the prompt (history/compaction) or raise "
                 "DATABRICKS_ITPM_* to the endpoint's real quota. 429s are "
                 "expected until then.",
-                self.model, prompt_tokens, self.input_tokens.rate,
+                self.model, prompt_tokens, self.input_tokens.rate_per_minute,
             )
         elif prompt_tokens > capacity:
             logger.warning(
