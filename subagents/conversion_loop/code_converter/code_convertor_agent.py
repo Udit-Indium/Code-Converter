@@ -973,6 +973,37 @@ def seed_conventions(callback_context: CallbackContext) -> None:
     # relied on here; those are what the rest of this package uses.
     if state.get("pyspark_conventions"):
         state["pyspark_conventions"] = ""
+
+    # Seed the key this agent's prompt interpolates. It is written by the parity
+    # agent's pytest run, which has not happened on the first iteration of the
+    # loop — the writer adds a batch and stops, then this agent runs. Without a
+    # default the prompt raises
+    # `KeyError: Context variable not found: pytest_last_result` before the
+    # agent starts, so the fixer never ran at all on iteration one.
+    #
+    # Seeded in the CONSUMER's own callback rather than the producer's, so it
+    # holds no matter which agent runs first or whether the suite ever ran.
+    if state.get("pytest_last_result") is None:
+        state["pytest_last_result"] = {
+            "passed": None,
+            "failed_tests": [],
+            "failed_count": 0,
+            "note": "The suite has not run yet — there is nothing to fix. "
+                    "Make NO changes and stop.",
+        }
+
+    # Same treatment for the semantic fixer, which shares this callback. Today
+    # `semantic_match` is seeded by the semantic validator's own callback and
+    # that agent always runs first in its loop — so this is currently
+    # redundant. It is here because relying on run order is exactly what failed
+    # above: a key that exists only because some other agent went first is one
+    # reordering away from a KeyError before the agent starts.
+    if state.get("semantic_match") is None:
+        state["semantic_match"] = {
+            "match": False,
+            "differences": [],
+            "message": "Semantic validation has not run yet.",
+        }
     return None
 
 
