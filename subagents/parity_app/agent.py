@@ -791,13 +791,27 @@ def add_pytest_tests_tool(context: ToolContext, tests_code: str) -> dict:
     context.state["pyspark_pytest_file_path"] = str(path)
 
     total = _extract_test_functions(merged)
-    return {
+    targets = list((context.state.get("functions_to_test") or {}).get("names") or [])
+    result = {
         "status": "success",
-        "saved_file_path": str(path),
         "tests_added_this_batch": changed,
         "total_tests_in_file": len(total),
-        "test_names": sorted(total),
     }
+
+    # One test per function is the rule, and the coverage check cannot enforce
+    # it: a suffixed name counts, so `test_x`, `test_x_empty` and
+    # `test_x_raises` all satisfy `x` and the extras pass unnoticed. Reported
+    # here instead, because unrequested extras are pure cost — they are written
+    # once and then re-sent in the prompt on every remaining turn.
+    if targets and len(total) > len(targets):
+        result["too_many_tests"] = True
+        result["expected_test_count"] = len(targets)
+        result["action_required"] = (
+            f"{len(total)} tests for {len(targets)} functions. This is a parity "
+            f"suite: exactly one test per function. Do not add more; if a "
+            f"function has several tests, that is over-testing, not coverage."
+        )
+    return result
 
 
 def read_pytest_file_tool(context: ToolContext) -> dict:
@@ -910,14 +924,25 @@ def build_parity_agent(name: str = "parity_test_case_validation_agent"):
             model="databricks/databricks-claude-opus-4-7",
         ),
         instruction="""You are an expert PySpark test engineer. You write pytest-based
-        parity test cases for a converted PySpark pipeline. There is ONE non-negotiable
-        rule: EVERY SINGLE FUNCTION listed below MUST have its own `test_<function_name>`
-        test. Do not skip any function for any reason — a missing test is a failure.
+        parity test cases for a converted PySpark pipeline.
+
+        EXACTLY ONE test per function — no more, no fewer.
+          * Every function listed below must have a `test_<function_name>`. A
+            missing test is a failure.
+          * Do NOT add a second test for a function you have already covered.
+            No separate happy-path / error-case / edge-case tests, no
+            `test_<name>_empty`, `test_<name>_raises`, `test_<name>_nulls`.
+        This is a PARITY suite: the question each test answers is "does the
+        converted function behave like the source function?", and that is one
+        comparison. Extra cases are unit testing — a different job, and every
+        extra test costs output tokens now and prompt tokens on every turn
+        after, which is what pushes this stage into rate limits.
+        If N functions are listed, the finished file has N tests.
 
         The converted PySpark module you are testing is importable as:
             from {pyspark_module_name} import <function_name>
 
-        Functions you MUST write a test for (write one `test_<name>` per function):
+        Functions to cover — write EXACTLY ONE `test_<name>` for each:
         <functions_to_test>
         {functions_to_test}
         </functions_to_test>
