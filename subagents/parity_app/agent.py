@@ -12,14 +12,6 @@ from google.adk.agents.callback_context import CallbackContext
 from google.adk.models.lite_llm import LiteLlm
 from google.adk.tools.tool_context import ToolContext
 from dotenv import load_dotenv
-# Reuses the PySpark AST parser that already ships with the case-fact checker
-# rather than vendoring a second 1,471-line copy that would drift.
-#
-# This resolves from INSIDE subagents, which is why it is a plain relative
-# import: `..` here means `subagents`, a package always fully imported before
-# this module loads. The same import spelled from a package at the repo root
-# failed with "attempted relative import beyond top-level package" (f7361b5) —
-# living next to its dependency is what makes the simple form safe.
 from ..conversion_loop.case_fact_validation_agent.tools import run_parser
 load_dotenv()
 
@@ -212,7 +204,7 @@ def load_functions_to_test(callback_context: CallbackContext):
         )
 
     try:
-        parsed = run_parser(script_path, follow_imports=False)
+        parsed = _run_parser_cached(str(script_path))
     except Exception as exc:
         state["functions_to_test"] = {
             "count": 0,
@@ -273,10 +265,24 @@ def load_functions_to_test(callback_context: CallbackContext):
     # batch is in the prompt, so nothing has to be remembered from a previous
     # turn and no in-turn tool result has to survive. That is what makes
     # dropping conversation history safe (see PARITY_INCLUDE_CONTENTS).
+    remaining = max(0, len(covered_free) - len(batch))
     state["current_batch"] = {
         "names": batch,
         "source": {n: bodies_all[n] for n in batch if n in bodies_all},
-        "remaining_after_this_batch": max(0, len(covered_free) - len(batch)),
+        "remaining_after_this_batch": remaining,
+        # Coverage is decided HERE, not by the writer. It used to get a
+        # get_missing_tests() tool and work out for itself whether anything was
+        # left — which is reasoning it does not need to do and got wrong,
+        # renaming tests that already counted and re-listing the same functions
+        # turns apart. The callback already knows: it computed this batch from
+        # the file on disk. So it just says what to do next.
+        "is_final_batch": remaining == 0,
+        "next_step": (
+            "This is the LAST batch. Submit it, then call run_pytest_tool() once."
+            if remaining == 0 else
+            f"After submitting, STOP. {remaining} function(s) remain and you will "
+            f"be re-invoked with the next batch. Do not run the suite yet."
+        ),
     }
 
     state["pyspark_module_name"] = pathlib.Path(script_path).stem
@@ -673,10 +679,9 @@ def read_converted_index_tool(context: ToolContext) -> dict:
     path = context.state.get("converted_pyspark_file_path")
     if not path or not os.path.isfile(str(path)):
         return {"exists": False, "functions": [], "error": "no converted module yet"}
-    try:
-        tree = ast.parse(pathlib.Path(str(path)).read_text(encoding="utf-8"))
-    except (OSError, SyntaxError) as exc:
-        return {"exists": False, "functions": [], "error": f"could not parse: {exc}"}
+    _src, tree = _read_and_parse(path)
+    if tree is None:
+        return {"exists": False, "functions": [], "error": "could not parse"}
 
     out = []
     for n in tree.body:
@@ -705,12 +710,10 @@ def read_converted_functions_tool(context: ToolContext, function_names: list[str
     if not path or not os.path.isfile(str(path)):
         return {"exists": False, "functions": {},
                 "not_found": list(function_names or [])}
-    try:
-        src = pathlib.Path(str(path)).read_text(encoding="utf-8")
-        tree = ast.parse(src)
-    except (OSError, SyntaxError) as exc:
+    src, tree = _read_and_parse(path)
+    if tree is None:
         return {"exists": False, "functions": {},
-                "not_found": list(function_names or []), "error": str(exc)}
+                "not_found": list(function_names or []), "error": "could not parse"}
 
     by_name = {
         n.name: (ast.get_source_segment(src, n) or ast.unparse(n))
@@ -851,50 +854,6 @@ def add_pytest_tests_tool(context: ToolContext, tests_code: str) -> dict:
     return result
 
 
-def get_missing_tests(context: ToolContext) -> dict:
-    """Which target functions still have NO test.
-
-    Call this to decide what to write next — it is the authoritative answer,
-    computed by the same rule that decides whether the stage is finished.
-    `parity_test_status` in your prompt is one iteration behind, because it is
-    written after your turn ends; this is current.
-
-    Returns counts and the missing names, never the test code: the bodies would
-    sit in context for the rest of the run and you never need them. The file is
-    merged by name in Python, so you never reproduce it.
-
-    A suffixed name counts: `test_load_orders_handles_nulls` covers
-    `load_orders`. You do not need to rename tests to bare `test_<function>`."""
-    path = _pytest_path()
-    if not path.exists():
-        return {"file_path": str(path), "exists": False,
-                "test_names": [], "line_count": 0}
-    content = path.read_text(encoding="utf-8")
-    try:
-        names = sorted(n.name for n in ast.parse(content).body
-                       if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-                       and n.name.startswith("test_"))
-    except SyntaxError:
-        names = []
-    # Coverage is ANSWERED here, not left for the model to work out. Without
-    # this it had to diff <functions_to_test> against these names in its head,
-    # reproducing _missing_functions' longest-match rule by eye — and it got it
-    # wrong repeatedly, re-deriving "what is left" every turn, re-adding tests
-    # it had already written and renaming ones that already counted. Each of
-    # those mistakes costs a full round-trip. The same function that decides the
-    # verdict now decides what to report, so the two can never disagree.
-    targets = list((context.state.get("functions_to_test") or {}).get("names") or [])
-    missing = _missing_functions(targets, names)
-    return {
-        "file_path": str(path),
-        "exists": True,
-        "test_count": len(names),
-        "missing_functions": missing,
-        "missing_count": len(missing),
-        "complete": bool(targets) and not missing,
-    }
-
-
 #: Whether the test WRITER receives conversation history.
 #:
 #: "none" is the point of everything above: the batch, its source bodies and
@@ -916,6 +875,19 @@ PARITY_INCLUDE_CONTENTS = os.environ.get("PARITY_INCLUDE_CONTENTS", "default")
 #: Hard ceiling on functions per iteration.
 BATCH_SIZE = 8
 
+#: Ceiling on ONE injected body before it is truncated with a fetch pointer.
+#:
+#: Measured on the converted module: 10 of 19 bodies exceed 3,000 characters and
+#: account for 79% of the total volume, so the long tail is where the cost is.
+#:
+#: Not replaced by an ID-and-fetch scheme, because a parity test must assert on
+#: real behaviour and the agent therefore needs the body of every function it
+#: tests — handing out IDs would buy one round-trip per function instead of one
+#: injection. Truncating only the outliers keeps the common case free and makes
+#: the model pay a round-trip solely for the bodies where it genuinely needs
+#: more than the opening.
+MAX_INJECTED_BODY_CHARS = 3000
+
 #: Ceiling on the SOURCE characters injected per iteration; the batch is capped
 #: by whichever limit binds first.
 #:
@@ -931,6 +903,67 @@ BATCH_CHAR_BUDGET = 12000
 RULES_FILE = "test_generation_rules.md"
 
 
+#: Cache of parsed files, keyed by (path, size, mtime).
+#:
+#: A PROCESS cache, not session state, on purpose: state is echoed into every
+#: prompt of every agent in the session, so serialising an AST there would
+#: re-send tens of kilobytes per turn — the opposite of the saving. Here the
+#: parse is reused for free and costs no tokens at all.
+#:
+#: Keyed by size AND mtime so the fixer editing the module between iterations
+#: invalidates it automatically. A rewrite that changes neither would be missed,
+#: which cannot happen for real edits and is why this is not hashed: hashing
+#: means reading the whole file on every lookup, which is most of what the cache
+#: is avoiding.
+_PARSE_CACHE: dict = {}
+
+#: Same idea for the expensive PySpark parser (a 1,471-line analysis, not a
+#: plain ast.parse), which ran on every before-agent callback.
+_RUN_PARSER_CACHE: dict = {}
+
+
+def _stat_key(path) -> "tuple | None":
+    try:
+        st = pathlib.Path(str(path)).stat()
+    except OSError:
+        return None
+    return (str(path), st.st_size, st.st_mtime)
+
+
+def _read_and_parse(path) -> "tuple[str, ast.Module] | tuple[str, None]":
+    """Source text and parsed tree for `path`, reusing the last parse.
+
+    Returns `(src, None)` when the file is unreadable or does not parse — the
+    callers all degrade rather than raise, and a failed parse is cached too so a
+    broken file is not re-parsed on every tool call.
+    """
+    key = _stat_key(path)
+    if key is None:
+        return "", None
+    hit = _PARSE_CACHE.get(key)
+    if hit is not None:
+        return hit
+    try:
+        src = pathlib.Path(str(path)).read_text(encoding="utf-8")
+        tree = ast.parse(src)
+    except (OSError, SyntaxError):
+        src, tree = "", None
+    _PARSE_CACHE[key] = (src, tree)
+    return src, tree
+
+
+def _run_parser_cached(script_path: str) -> dict:
+    """`run_parser` for `script_path`, reused while the file is unchanged."""
+    key = _stat_key(script_path)
+    if key is None:
+        return {}
+    hit = _RUN_PARSER_CACHE.get(key)
+    if hit is None:
+        hit = run_parser(script_path, follow_imports=False)
+        _RUN_PARSER_CACHE[key] = hit
+    return hit
+
+
 def _batch_bodies(script_path: str, names: list[str]) -> dict:
     """Real source of just these functions, keyed by name.
 
@@ -940,18 +973,31 @@ def _batch_bodies(script_path: str, names: list[str]) -> dict:
     """
     if not names:
         return {}
-    try:
-        src = pathlib.Path(script_path).read_text(encoding="utf-8")
-        tree = ast.parse(src)
-    except (OSError, SyntaxError):
+    src, tree = _read_and_parse(script_path)
+    if tree is None:
         return {}
     wanted = set(names)
-    return {
-        n.name: (ast.get_source_segment(src, n) or ast.unparse(n))
-        for n in tree.body
-        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-        and n.name in wanted
-    }
+    out: dict = {}
+    for n in tree.body:
+        if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if n.name not in wanted:
+            continue
+        body = ast.get_source_segment(src, n) or ast.unparse(n)
+        if len(body) > MAX_INJECTED_BODY_CHARS:
+            # Cut at a line boundary so the fragment is still readable code,
+            # and say plainly that it is a fragment — a body that merely stops
+            # mid-statement invites assertions about logic that was cut off.
+            head = body[:MAX_INJECTED_BODY_CHARS].rsplit("\n", 1)[0]
+            body = (
+                head
+                + f"\n    # ... TRUNCATED ({len(body):,} chars total). This is the "
+                  f"opening only.\n    # Call read_converted_functions_tool(['{n.name}']) "
+                  f"for the full body\n    # BEFORE asserting on anything below this "
+                  f"point."
+            )
+        out[n.name] = body
+    return out
 
 
 def _pytest_text() -> str:
@@ -1068,10 +1114,10 @@ def build_parity_agent(name: str = "parity_test_case_validation_agent"):
         the batch — you do not need a tool call to see them. Assert against what
         that code actually does; never guess behaviour from a name.
 
-        Loop: write exactly one `test_<function_name>` for each function in the
-        batch, submit them with add_pytest_tests_tool, then stop. You are
-        re-invoked with the next batch. When get_missing_tests() reports
-        complete, run the suite once.
+        Write exactly one `test_<function_name>` for each function in the batch,
+        submit them with add_pytest_tests_tool, then follow
+        `current_batch.next_step`. Do not work out what is left or whether the
+        suite is complete — that is decided for you and is already in the batch.
 
         Assume nothing carries over between turns. Everything you need is in
         this prompt, recomputed from what is on disk right now.
@@ -1088,7 +1134,6 @@ def build_parity_agent(name: str = "parity_test_case_validation_agent"):
           already in <current_batch>.
         - add_pytest_tests_tool(tests_code): submit the batch; merges by name, so
           never resend a test that is already in the file.
-        - get_missing_tests(): which functions still have NO test. Authoritative.
         - run_pytest_tool(): run on Databricks; returns a structured result.
         - read_converted_index_tool(): signatures, if <current_batch> is not enough.
         """,
@@ -1096,7 +1141,6 @@ def build_parity_agent(name: str = "parity_test_case_validation_agent"):
             read_converted_index_tool,
             read_converted_functions_tool,
             add_pytest_tests_tool,
-            get_missing_tests,
             read_rules_tool,
             run_pytest_tool,
         ],
