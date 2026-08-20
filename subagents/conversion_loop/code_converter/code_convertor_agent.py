@@ -1389,8 +1389,8 @@ semantic_code_fixer_agent = Agent(
 def build_code_fixer_agent(name: str = "code_fixer_agent"):
     """Repairs the converted module against a FAILING pytest parity suite.
 
-    Reads `pytest_last_stdout` and `parity_test_status` — both written by the
-    parity agent — and edits only the functions those name, via
+    Reads `pytest_last_result` — a dict written by the parity agent listing which
+    tests failed and why — and edits only the functions it names, via
     replace_functions_tool. It never touches the tests: a test that correctly
     encodes the source behaviour and fails is evidence the conversion is wrong,
     so letting the fixer "solve" it by weakening the test would hide the bug it
@@ -1416,16 +1416,13 @@ def build_code_fixer_agent(name: str = "code_fixer_agent"):
         Never introduce pandas idioms (`pd.`, `.merge`, `.rename(columns=)`, `.iloc`, `df.apply`)
         or numpy column-building patterns into the corrected code.
 
-        Condensed pytest result — this lists only the FAILING tests and a short error for
-        each (test `test_<function_name>` maps to the function `<function_name>`):
+        Failing tests, as structured data. `failed_tests[].test` is
+        `test_<function_name>`, so strip the `test_` prefix to get the function to
+        fix. `run_error` appears instead when the run itself broke (import error,
+        cluster problem) rather than any individual test failing:
         <pytest_result>
-        {pytest_last_stdout}
+        {pytest_last_result}
         </pytest_result>
-
-        Latest parity verdict:
-        <parity_test_status>
-        {parity_test_status}
-        </parity_test_status>
 
         HOW TO WORK (surgical, batched — follow exactly):
         1. From <pytest_result>, list the FAILING functions (strip the `test_` prefix from

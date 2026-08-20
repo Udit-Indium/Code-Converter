@@ -239,10 +239,44 @@ def load_functions_to_test(callback_context: CallbackContext):
         ]
         signatures[f["name"]] = [n for n in names_only if n]
 
+    # The FULL list stays in state for the coverage check and the tools; only
+    # the current batch is injected into the prompt. Showing 80 names while the
+    # agent works on 8 re-sends 72 it cannot act on, every iteration.
     state["functions_to_test"] = {
         "count": len(function_names),
         "names": function_names,
         "signatures": signatures,
+    }
+
+    # Which 8 to work on now, decided here rather than left to the model:
+    # "the ones with no test yet" is a fact about the file on disk, and reading
+    # it from disk each turn also makes the batch self-correcting — anything
+    # written last turn drops out without the model having to remember it.
+    covered_free = _missing_functions(
+        function_names, _extract_test_functions(_pytest_text())
+    )
+    bodies_all = _batch_bodies(str(script_path), covered_free[:BATCH_SIZE])
+    batch: list[str] = []
+    used = 0
+    for name in covered_free[:BATCH_SIZE]:
+        size = len(bodies_all.get(name, ""))
+        if batch and used + size > BATCH_CHAR_BUDGET:
+            break
+        batch.append(name)
+        used += size
+
+    # Bodies injected, not fetched. The agent read them with a tool on its first
+    # move every single turn, and a tool call is a whole extra model round-trip
+    # that re-sends the entire prompt — far more than the bodies are worth.
+    #
+    # It also makes the turn SELF-CONTAINED: everything needed to write this
+    # batch is in the prompt, so nothing has to be remembered from a previous
+    # turn and no in-turn tool result has to survive. That is what makes
+    # dropping conversation history safe (see PARITY_INCLUDE_CONTENTS).
+    state["current_batch"] = {
+        "names": batch,
+        "source": {n: bodies_all[n] for n in batch if n in bodies_all},
+        "remaining_after_this_batch": max(0, len(covered_free) - len(batch)),
     }
 
     state["pyspark_module_name"] = pathlib.Path(script_path).stem
@@ -535,7 +569,10 @@ def _run_pytest_suite(state) -> "int | None":
 
         state["pytest_last_returncode"] = returncode
         state["pytest_last_stdout"] = _summarize_pytest(stdout, "", returncode)
-        state["pytest_last_stderr"] = "" 
+        state["pytest_last_stderr"] = ""
+        # Structured twin of the summary, for the fixer's prompt. The prose form
+        # stays for reading the trace; the agent is handed the dict.
+        state["pytest_last_result"] = _structured_pytest_result(stdout, "", returncode) 
         return returncode
 
     except Exception as exc:
@@ -814,7 +851,7 @@ def add_pytest_tests_tool(context: ToolContext, tests_code: str) -> dict:
     return result
 
 
-def read_pytest_file_tool(context: ToolContext) -> dict:
+def get_missing_tests(context: ToolContext) -> dict:
     """Which target functions still have NO test.
 
     Call this to decide what to write next — it is the authoritative answer,
@@ -858,25 +895,125 @@ def read_pytest_file_tool(context: ToolContext) -> dict:
     }
 
 
-def _failing_test_names(pytest_stdout: str) -> list[str]:
-    """Just the names of the tests that failed.
+#: Whether the test WRITER receives conversation history.
+#:
+#: "none" is the point of everything above: the batch, its source bodies and
+#: the coverage answer are all recomputed from disk each turn, so a turn needs
+#: nothing that happened in an earlier one. History is then pure cost — and in
+#: this pipeline it is the dominant cost, because all four stages share one
+#: session and parity runs last, inheriting parsing, conversion and semantic
+#: validation. That is how a single request reached a 202,272-token prompt
+#: against a 200,000 ITPM quota.
+#:
+#: Left at "default" because it is unverified, not because it is wrong: if
+#: ADK's "none" also strips the CURRENT turn's own tool responses, the writer
+#: would submit a batch and never see the result. Everything is in place for it
+#: to work; flip PARITY_INCLUDE_CONTENTS=none to try it, and back if the writer
+#: stops making progress. The fixer keeps history either way — it reads its own
+#: tool results mid-turn and has no equivalent injection.
+PARITY_INCLUDE_CONTENTS = os.environ.get("PARITY_INCLUDE_CONTENTS", "default")
 
-    Enough for the test writer to see its coverage is complete but the code is
-    wrong, without carrying every traceback in its context for the rest of the
-    run. The fixer still receives the full summary.
+#: Hard ceiling on functions per iteration.
+BATCH_SIZE = 8
+
+#: Ceiling on the SOURCE characters injected per iteration; the batch is capped
+#: by whichever limit binds first.
+#:
+#: A fixed count is the wrong unit once bodies are injected rather than fetched:
+#: the refactored functions range from ~90 to ~7,700 characters, so "8
+#: functions" is anywhere between a small prompt and a very large one. Budgeting
+#: by size keeps every turn roughly the same cost. The first function is always
+#: taken even if it alone exceeds the budget, otherwise an oversized function
+#: would never be offered and the loop would spin on it forever.
+BATCH_CHAR_BUDGET = 12000
+
+#: Static rules and workflow, fetched on demand instead of ridden in the prompt.
+RULES_FILE = "test_generation_rules.md"
+
+
+def _batch_bodies(script_path: str, names: list[str]) -> dict:
+    """Real source of just these functions, keyed by name.
+
+    Read from disk each turn rather than carried in state, so a batch always
+    reflects the module as it is now — the fixer edits that module between
+    iterations, and a remembered body would be stale exactly when it matters.
     """
-    if not pytest_stdout:
-        return []
-    names: list[str] = []
-    for line in pytest_stdout.splitlines():
+    if not names:
+        return {}
+    try:
+        src = pathlib.Path(script_path).read_text(encoding="utf-8")
+        tree = ast.parse(src)
+    except (OSError, SyntaxError):
+        return {}
+    wanted = set(names)
+    return {
+        n.name: (ast.get_source_segment(src, n) or ast.unparse(n))
+        for n in tree.body
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        and n.name in wanted
+    }
+
+
+def _pytest_text() -> str:
+    """Current contents of the generated test file, or "" if there is none."""
+    path = _pytest_path()
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def _rules_text() -> str:
+    """The rules markdown, or an explanatory string if it is missing."""
+    path = pathlib.Path(__file__).with_name(RULES_FILE)
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return f"(rules file unavailable: {exc})"
+
+
+def read_rules_tool(context: ToolContext) -> dict:
+    """The full test-generation rules and workflow.
+
+    Call this once at the start of a run, or whenever you are unsure how to
+    proceed. It holds the counting rule, the Spark fixture requirements, the
+    naming rule and the never-weaken-a-test rule.
+
+    Kept out of the prompt deliberately: it is static, so injecting it would
+    re-send the same ~1,600 tokens on every iteration of every run.
+    """
+    return {"rules": _rules_text()}
+
+
+def _structured_pytest_result(stdout: str, stderr: str, returncode: "int | None") -> dict:
+    """Machine-shaped pytest outcome, in place of prose.
+
+    The fixer needs which tests failed and why — not a rendered report. A dict
+    says the same thing in a fraction of the tokens, survives being re-sent on
+    later turns, and cannot be misread the way a truncated traceback can.
+    """
+    failed: list[dict] = []
+    for line in (stdout or "").splitlines():
         stripped = line.strip()
         for marker in ("FAILED ", "ERROR "):
-            if stripped.startswith(marker):
-                token = stripped[len(marker):].split(" ")[0]
-                name = token.rsplit("::", 1)[-1].strip()
-                if name and name not in names:
-                    names.append(name)
-    return names
+            if not stripped.startswith(marker):
+                continue
+            body = stripped[len(marker):]
+            token, _, detail = body.partition(" - ")
+            name = token.split(" ")[0].rsplit("::", 1)[-1].strip()
+            if name and not any(f["test"] == name for f in failed):
+                failed.append({"test": name, "error": _cap(detail.strip(), 200)})
+    result = {
+        "passed": returncode == 0,
+        "failed_tests": failed,
+        "failed_count": len(failed),
+    }
+    if returncode != 0 and not failed:
+        # Nothing parsed as a test failure: the run itself broke (import error,
+        # cluster problem). Pass the raw text through rather than reporting an
+        # empty failure list, which would read as "nothing wrong".
+        result["run_error"] = _cap(stderr or stdout, 600)
+    return result
 
 
 def run_pytest_tool(context: ToolContext) -> dict:
@@ -897,14 +1034,7 @@ def run_pytest_tool(context: ToolContext) -> dict:
     stdout = context.state.get("pytest_last_stdout", "") or ""
     stderr = context.state.get("pytest_last_stderr", "") or ""
 
-    result = {
-        "success": returncode == 0,
-        "returncode": returncode,
-        "failing_tests": _failing_test_names(stdout),
-    }
-    if returncode != 0 and not result["failing_tests"]:
-        result["error_output"] = _cap(stderr or stdout, 800)
-    return result
+    return _structured_pytest_result(stdout, stderr, returncode)
 
 
 
@@ -923,118 +1053,54 @@ def build_parity_agent(name: str = "parity_test_case_validation_agent"):
         model=LiteLlm(
             model="databricks/databricks-claude-opus-4-7",
         ),
-        instruction="""You are an expert PySpark test engineer. You write pytest-based
-        parity test cases for a converted PySpark pipeline.
+        instruction="""You write pytest parity tests for a converted PySpark module.
 
-        EXACTLY ONE test per function — no more, no fewer.
-          * Every function listed below must have a `test_<function_name>`. A
-            missing test is a failure.
-          * Do NOT add a second test for a function you have already covered.
-            No separate happy-path / error-case / edge-case tests, no
-            `test_<name>_empty`, `test_<name>_raises`, `test_<name>_nulls`.
-        This is a PARITY suite: the question each test answers is "does the
-        converted function behave like the source function?", and that is one
-        comparison. Extra cases are unit testing — a different job, and every
-        extra test costs output tokens now and prompt tokens on every turn
-        after, which is what pushes this stage into rate limits.
-        If N functions are listed, the finished file has N tests.
+        The module is importable as: from {pyspark_module_name} import <function_name>
 
-        The converted PySpark module you are testing is importable as:
-            from {pyspark_module_name} import <function_name>
+        Work on THIS BATCH ONLY. These are the functions that still have no test;
+        the list is recomputed each turn, so anything you wrote last turn is
+        already gone from it:
+        <current_batch>
+        {current_batch}
+        </current_batch>
 
-        Functions to cover — write EXACTLY ONE `test_<name>` for each:
-        <functions_to_test>
-        {functions_to_test}
-        </functions_to_test>
+        `current_batch.source` already holds the REAL body of every function in
+        the batch — you do not need a tool call to see them. Assert against what
+        that code actually does; never guess behaviour from a name.
 
-        Result of the LAST completed iteration. It is one turn behind, because it
-        is computed after your turn ends — do NOT work out coverage from it, and
-        do not re-derive it yourself by comparing names. Call
-        read_pytest_file_tool() for the current, authoritative list of what is
-        still uncovered:
-        <parity_test_status>
-        {parity_test_status}
-        </parity_test_status>
+        Loop: write exactly one `test_<function_name>` for each function in the
+        batch, submit them with add_pytest_tests_tool, then stop. You are
+        re-invoked with the next batch. When get_missing_tests() reports
+        complete, run the suite once.
 
-        THE CONVERTED MODULE IS ON DISK, NOT IN THIS PROMPT. Read only what the
-        current batch needs:
-          * **read_converted_index_tool()** — re-reads names and parameters. You
-            ALREADY have these in <functions_to_test>; plan your batches from
-            what is in front of you. Call this only if the module changed.
-          * **read_converted_functions_tool(function_names=[...])** — the real bodies
-            of the functions you are testing this turn. Assert against what the
-            code actually does; never guess behaviour from a name.
-            Ask for the WHOLE batch in ONE call — all 8-10 names together. Every
-            separate call is a full model round-trip that re-sends this entire
-            prompt, so fetching two functions at a time costs several times what
-            the bodies themselves are worth.
+        Assume nothing carries over between turns. Everything you need is in
+        this prompt, recomputed from what is on disk right now.
 
-        Output of the previous local pytest run (if the suite failed because a TEST is
-        wrong, fix the test; if it failed because the CONVERTED CODE is wrong, keep the
-        correct test as-is — the code will be fixed by another agent):
-        <pytest_stdout>
-        {pytest_last_stdout}
-        </pytest_stdout>
-        <pytest_stderr>
-        {pytest_last_stderr}
-        </pytest_stderr>
-
-        HOW TO WORK (batched — follow exactly):
-        1. Work through `functions_to_test.names` in BATCHES of about 8-10 functions.
-           For each name in the batch define a pytest function called exactly
-           `test_<function_name>`. NEVER attempt the whole suite in one response: your
-           output is capped at ~8k tokens, and a cut-off response loses the entire
-           tool call. Call **read_converted_functions_tool** for exactly that batch to
-           see what the functions really do before writing their tests.
-        2. Create a shared module-scoped SparkSession fixture using plain
-           `SparkSession.builder.getOrCreate()` — the suite runs on Databricks, so it must
-           bind to the session already present there. Do NOT call `.master("local[*]")`
-           or otherwise try to start a local Spark. Build small
-           in-memory DataFrames with `spark.createDataFrame(...)` for inputs. Assert on
-           the real behaviour of each function — schema, row counts, and concrete values
-           via `df.collect()` — based on the real body you fetched in step 1. Do not
-           invent behaviour.
-        3. For functions that are hard to assert directly (e.g. session builders or
-           orchestrators), still write a `test_<name>` smoke test that calls the function
-           and asserts it runs / returns without error.
-        4. Call **add_pytest_tests_tool(tests_code=...)** with ONLY that batch. On the
-           FIRST call include the imports and the SparkSession fixture as well. The tool
-           merges batches by name, so nothing you sent earlier is lost — never resend a
-           test that is already in the file. It returns `total_tests_in_file` and
-           `test_names` so you can track progress.
-        5. Repeat steps 1 and 4, batch after batch, until EVERY name in
-           `functions_to_test.names` has a test. Compare `test_names` against that list
-           before you finish; a missing test is a failure.
-        6. Only once the whole suite is in, run it ONCE with **run_pytest_tool**
-           (it executes on Databricks).
-        7. CRITICAL RULE: never delete, weaken, or trivialise a test just to make the
-           suite pass. If a test correctly reflects the source logic but fails, leave it
-           failing — that signals the converted code must be fixed elsewhere.
-        8. To find out what is left, call read_pytest_file_tool() — do not work it
-           out by comparing <functions_to_test> against names you remember writing.
-           It returns `missing_functions` and `complete`, decided by the same rule
-           that ends this stage, so it can never disagree with the verdict.
-        9. A suffixed test name COUNTS: `test_load_orders_handles_nulls` covers
-           `load_orders`. Never rename a test to satisfy the coverage rule — if
-           read_pytest_file_tool() still lists a function, the test is genuinely
-           absent, not misnamed.
+        Call read_rules_tool() before your first batch, and any time you are
+        unsure: it holds the counting rule, the Spark fixture requirements, the
+        naming rule, and the rule about never weakening a test. Those rules are
+        binding — not reading them is not an excuse for breaking them.
 
         Tools:
-        - read_converted_index_tool(): re-read signatures (rarely needed —
-          <functions_to_test> already has them).
-        - read_converted_functions_tool(function_names): real bodies. Pass the WHOLE
-          batch of 8-10 names in ONE call, not two at a time.
-        - add_pytest_tests_tool(tests_code): add a BATCH of 8-10 tests; merges by name.
-        - read_pytest_file_tool(): which functions still have NO test (authoritative).
-        - run_pytest_tool(): run the suite on Databricks and get pass/fail + output.
+        - read_rules_tool(): the workflow and rules in full.
+        - read_converted_functions_tool(names): bodies of functions OUTSIDE the
+          batch, if a test genuinely needs one. The batch's own bodies are
+          already in <current_batch>.
+        - add_pytest_tests_tool(tests_code): submit the batch; merges by name, so
+          never resend a test that is already in the file.
+        - get_missing_tests(): which functions still have NO test. Authoritative.
+        - run_pytest_tool(): run on Databricks; returns a structured result.
+        - read_converted_index_tool(): signatures, if <current_batch> is not enough.
         """,
         tools=[
             read_converted_index_tool,
             read_converted_functions_tool,
             add_pytest_tests_tool,
-            read_pytest_file_tool,
+            get_missing_tests,
+            read_rules_tool,
             run_pytest_tool,
         ],
+        include_contents=PARITY_INCLUDE_CONTENTS,
         mode="task",
         output_key="test_generation_output",
         before_agent_callback=load_functions_to_test,
