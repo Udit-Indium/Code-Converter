@@ -5,10 +5,14 @@ One definition, two entry points.
   * In the pipeline — `build_parity_loop()` is appended to the orchestrator's
     sub_agents (after SEMS). This is the automatic path.
   * On its own — `app` / `root_agent`, for re-checking a module without
-    re-converting it. Discovery is by directory, and this package now lives
-    inside subagents/, so the standalone launch is:
+    re-converting it. Discovery is by directory, and this package lives inside
+    subagents/, so the standalone launch is:
 
         cd <repo>/subagents && adk web        # then pick "parity_app"
+
+    Standalone also starts a FRESH session. In the pipeline every stage shares
+    one, so parity runs last and inherits every earlier event — which is how a
+    single request reached a 202,272-token prompt against a 200,000 ITPM quota.
 
 Either way the target resolves the same: `converted_pyspark_file_path` from
 state when the pipeline set it, else the newest `*_spark.py` in outputs/,
@@ -23,6 +27,8 @@ An unchanged module skips the whole stage; see `_already_passed` in agent.py.
 """
 
 from __future__ import annotations
+import os
+
 from google.adk.agents import LoopAgent
 from google.adk.apps import App
 from google.adk.apps.app import EventsCompactionConfig
@@ -58,9 +64,22 @@ def build_parity_loop(name: str = "parity_test_agent") -> LoopAgent:
     )
 root_agent = build_parity_loop("parity_app")
 
+#: How often session history is summarised. Tunable without a code edit,
+#: because it is the one lever that shrinks the prompt without changing what an
+#: agent can see inside a turn — it trades summarisation calls for prompt size,
+#: so a wrong value costs money or latency, never correctness.
+#:
+#: Lowered from 5 to 3 after a run hit the Databricks ITPM ceiling: a single
+#: request carried a 202,272-token prompt against a 200,000 ITPM quota, so no
+#: pacing could make it fit. Later stages inherit every earlier stage's events
+#: in one shared session, so the prompt grows across the whole pipeline rather
+#: than within one agent.
+COMPACTION_INTERVAL = int(os.environ.get("ADK_COMPACTION_INTERVAL", "3"))
+COMPACTION_OVERLAP = int(os.environ.get("ADK_COMPACTION_OVERLAP", "2"))
+
 events_compaction_config = EventsCompactionConfig(
-    compaction_interval=5,
-    overlap_size=2,
+    compaction_interval=COMPACTION_INTERVAL,
+    overlap_size=COMPACTION_OVERLAP,
 )
 app = App(
     name="parity_app",

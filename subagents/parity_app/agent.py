@@ -16,10 +16,10 @@ from dotenv import load_dotenv
 # rather than vendoring a second 1,471-line copy that would drift.
 #
 # This resolves from INSIDE subagents, which is why it is a plain relative
-# import again: `..` here means `subagents`, a package that is always fully
-# imported before this module loads. The same import spelled from a package at
-# the repo root failed with "attempted relative import beyond top-level
-# package" — living next to its dependency is what makes the simple form safe.
+# import: `..` here means `subagents`, a package always fully imported before
+# this module loads. The same import spelled from a package at the repo root
+# failed with "attempted relative import beyond top-level package" (f7361b5) —
+# living next to its dependency is what makes the simple form safe.
 from ..conversion_loop.case_fact_validation_agent.tools import run_parser
 load_dotenv()
 
@@ -801,12 +801,19 @@ def add_pytest_tests_tool(context: ToolContext, tests_code: str) -> dict:
 
 
 def read_pytest_file_tool(context: ToolContext) -> dict:
-    """List the tests already written to outputs/pyspark_pytest.py.
+    """Which target functions still have NO test.
 
-    Returns test names and a line count, NOT the test code. The reason to call
-    this is to avoid writing a test that already exists, and the names answer
-    that; the bodies would sit in context for the rest of the run for nothing.
-    The file is merged by name in Python, so you never need to reproduce it."""
+    Call this to decide what to write next — it is the authoritative answer,
+    computed by the same rule that decides whether the stage is finished.
+    `parity_test_status` in your prompt is one iteration behind, because it is
+    written after your turn ends; this is current.
+
+    Returns counts and the missing names, never the test code: the bodies would
+    sit in context for the rest of the run and you never need them. The file is
+    merged by name in Python, so you never reproduce it.
+
+    A suffixed name counts: `test_load_orders_handles_nulls` covers
+    `load_orders`. You do not need to rename tests to bare `test_<function>`."""
     path = _pytest_path()
     if not path.exists():
         return {"file_path": str(path), "exists": False,
@@ -818,8 +825,23 @@ def read_pytest_file_tool(context: ToolContext) -> dict:
                        and n.name.startswith("test_"))
     except SyntaxError:
         names = []
-    return {"file_path": str(path), "exists": True, "test_names": names,
-            "line_count": len(content.splitlines())}
+    # Coverage is ANSWERED here, not left for the model to work out. Without
+    # this it had to diff <functions_to_test> against these names in its head,
+    # reproducing _missing_functions' longest-match rule by eye — and it got it
+    # wrong repeatedly, re-deriving "what is left" every turn, re-adding tests
+    # it had already written and renaming ones that already counted. Each of
+    # those mistakes costs a full round-trip. The same function that decides the
+    # verdict now decides what to report, so the two can never disagree.
+    targets = list((context.state.get("functions_to_test") or {}).get("names") or [])
+    missing = _missing_functions(targets, names)
+    return {
+        "file_path": str(path),
+        "exists": True,
+        "test_count": len(names),
+        "missing_functions": missing,
+        "missing_count": len(missing),
+        "complete": bool(targets) and not missing,
+    }
 
 
 def _failing_test_names(pytest_stdout: str) -> list[str]:
@@ -900,8 +922,11 @@ def build_parity_agent(name: str = "parity_test_case_validation_agent"):
         {functions_to_test}
         </functions_to_test>
 
-        Result of the previous validation (read this — `missing_functions` lists the
-        functions that STILL have no test; you MUST add a test for every one of them):
+        Result of the LAST completed iteration. It is one turn behind, because it
+        is computed after your turn ends — do NOT work out coverage from it, and
+        do not re-derive it yourself by comparing names. Call
+        read_pytest_file_tool() for the current, authoritative list of what is
+        still uncovered:
         <parity_test_status>
         {parity_test_status}
         </parity_test_status>
@@ -912,8 +937,12 @@ def build_parity_agent(name: str = "parity_test_case_validation_agent"):
             ALREADY have these in <functions_to_test>; plan your batches from
             what is in front of you. Call this only if the module changed.
           * **read_converted_functions_tool(function_names=[...])** — the real bodies
-            of just the functions you are testing this turn. Assert against what the
+            of the functions you are testing this turn. Assert against what the
             code actually does; never guess behaviour from a name.
+            Ask for the WHOLE batch in ONE call — all 8-10 names together. Every
+            separate call is a full model round-trip that re-sends this entire
+            prompt, so fetching two functions at a time costs several times what
+            the bodies themselves are worth.
 
         Output of the previous local pytest run (if the suite failed because a TEST is
         wrong, fix the test; if it failed because the CONVERTED CODE is wrong, keep the
@@ -956,15 +985,22 @@ def build_parity_agent(name: str = "parity_test_case_validation_agent"):
         7. CRITICAL RULE: never delete, weaken, or trivialise a test just to make the
            suite pass. If a test correctly reflects the source logic but fails, leave it
            failing — that signals the converted code must be fixed elsewhere.
-        8. If `parity_test_status.missing_functions` is non-empty, you did NOT cover
-           them — send their `test_<name>` in a further batch.
+        8. To find out what is left, call read_pytest_file_tool() — do not work it
+           out by comparing <functions_to_test> against names you remember writing.
+           It returns `missing_functions` and `complete`, decided by the same rule
+           that ends this stage, so it can never disagree with the verdict.
+        9. A suffixed test name COUNTS: `test_load_orders_handles_nulls` covers
+           `load_orders`. Never rename a test to satisfy the coverage rule — if
+           read_pytest_file_tool() still lists a function, the test is genuinely
+           absent, not misnamed.
 
         Tools:
         - read_converted_index_tool(): re-read signatures (rarely needed —
           <functions_to_test> already has them).
-        - read_converted_functions_tool(function_names): real bodies of a batch.
+        - read_converted_functions_tool(function_names): real bodies. Pass the WHOLE
+          batch of 8-10 names in ONE call, not two at a time.
         - add_pytest_tests_tool(tests_code): add a BATCH of 8-10 tests; merges by name.
-        - read_pytest_file_tool(): read the current test file.
+        - read_pytest_file_tool(): which functions still have NO test (authoritative).
         - run_pytest_tool(): run the suite on Databricks and get pass/fail + output.
         """,
         tools=[

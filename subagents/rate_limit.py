@@ -370,6 +370,40 @@ class EndpointLimiter:
             return int(capacity)
         return int(max_tokens)
 
+    def _input_charge(self, prompt_tokens: int) -> int:
+        """Mirror of `_output_charge` for the input bucket.
+
+        `acquire` clamps silently, so a prompt larger than the burst capacity is
+        charged as capacity and the rest is spent unaccounted — the limiter then
+        believes it can afford several times the real rate and the 429 arrives
+        from the server instead. Output has warned about this since the start;
+        input did the same clamp with no warning at all, which is how a prompt
+        four times the burst allowance went unnoticed.
+
+        A prompt above the FULL per-minute quota is worse than a tuning problem:
+        no pacing can make one request fit in a minute's budget, so that case is
+        called out separately.
+        """
+        capacity = self.input_tokens.capacity
+        if prompt_tokens > self.input_tokens.rate:
+            logger.error(
+                "RateLimiter | %s | prompt of %d tokens EXCEEDS the whole ITPM "
+                "quota of %.0f. No pacing can fit this request into a minute's "
+                "budget — shrink the prompt (history/compaction) or raise "
+                "DATABRICKS_ITPM_* to the endpoint's real quota. 429s are "
+                "expected until then.",
+                self.model, prompt_tokens, self.input_tokens.rate,
+            )
+        elif prompt_tokens > capacity:
+            logger.warning(
+                "RateLimiter | %s | prompt of %d tokens exceeds the input burst "
+                "capacity of %.0f; the charge is clamped, so the limiter is "
+                "under-counting by %d per call. Raise RATE_LIMIT_BURST_FRACTION "
+                "or shrink the prompt.",
+                self.model, prompt_tokens, capacity, prompt_tokens - int(capacity),
+            )
+        return int(prompt_tokens)
+
     def reserve(self, prompt_tokens: int, max_tokens: int) -> Reservation:
         """Acquire budget for one request, blocking until it is available.
 
@@ -378,6 +412,7 @@ class EndpointLimiter:
         sitting on a request slot and input headroom while it waits.
         """
         charged = self._output_charge(max_tokens)
+        self._input_charge(prompt_tokens)
         waited = self.requests.acquire(1.0)
         waited += self.input_tokens.acquire(prompt_tokens)
         waited += self.output_tokens.acquire(charged)
@@ -393,6 +428,7 @@ class EndpointLimiter:
     async def reserve_async(self, prompt_tokens: int, max_tokens: int) -> Reservation:
         """Async twin of `reserve`, for callers on an event loop."""
         charged = self._output_charge(max_tokens)
+        self._input_charge(prompt_tokens)
         waited = await self.requests.acquire_async(1.0)
         waited += await self.input_tokens.acquire_async(prompt_tokens)
         waited += await self.output_tokens.acquire_async(charged)
