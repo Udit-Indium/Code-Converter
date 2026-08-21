@@ -9,7 +9,12 @@ from .subagents.conversion_loop import (
     conversion_loop_agent,
     semantic_validation_loop_agent,
 )
-from .subagents.parity_app import build_parity_loop
+# parity_app is deliberately NOT imported here. It is a standalone app with its
+# own root_agent and App — see subagents/parity_app/__init__.py. Adding it back
+# as a stage costs more than the stage itself: every sub_agent shares one
+# session, so whatever runs last inherits all the events before it, and parity
+# running fourth carried a 176,000-202,000 token prompt against a 200,000 ITPM
+# quota purely from history it never used.
 
 
 root_agent = SequentialAgent(
@@ -20,14 +25,13 @@ root_agent = SequentialAgent(
         "inventory), runs the conversion loop that converts and fact-checks until "
         "the case facts match, runs the semantic-validation loop that compares "
         "Python vs PySpark outputs on a dummy dataset and fixes the converted code "
-        "until they match, then writes and runs a pytest parity suite over the "
-        "converted module and reports coverage and pass/fail."
+        "until they match. The pytest parity suite is a separate app, run on "
+        "demand against the finished module rather than as a stage here."
     ),
     sub_agents=[
         code_parser_agent,
         conversion_loop_agent,
         semantic_validation_loop_agent,
-        build_parity_loop("parity_test_agent"),
     ],
 )
 
@@ -38,9 +42,9 @@ root_agent = SequentialAgent(
 #:
 #: Lowered from 5 to 3 after a run hit the Databricks ITPM ceiling: a single
 #: request carried a 202,272-token prompt against a 200,000 ITPM quota, so no
-#: pacing could make it fit. Later stages inherit every earlier stage's events
-#: in one shared session, so the prompt grows across the whole pipeline rather
-#: than within one agent.
+#: pacing could make it fit. Stages share one session, so the prompt grows
+#: across the whole pipeline rather than within one agent — which is why the
+#: parity suite was moved out of it entirely.
 COMPACTION_INTERVAL = int(os.environ.get("ADK_COMPACTION_INTERVAL", "3"))
 COMPACTION_OVERLAP = int(os.environ.get("ADK_COMPACTION_OVERLAP", "2"))
 

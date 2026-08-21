@@ -1,29 +1,27 @@
-"""Parity-test stage: write a pytest suite, run it, repair what fails.
+"""Standalone parity-test app: write a pytest suite, run it, repair what fails.
 
-One definition, two entry points.
+Deliberately NOT a stage in the conversion pipeline. Every sub_agent of the
+orchestrator shares one session, so whatever runs last inherits all the events
+before it — running fourth put this agent's prompt at 176,000-202,000 tokens
+against a 200,000 ITPM quota, almost entirely from conversion history it never
+read. A separate app gets a fresh session and starts near zero.
 
-  * In the pipeline — `build_parity_loop()` is appended to the orchestrator's
-    sub_agents (after SEMS). This is the automatic path.
-  * On its own — `app` / `root_agent`, for re-checking a module without
-    re-converting it. Discovery is by directory, and this package lives inside
-    subagents/, so the standalone launch is:
+Run it after the pipeline finishes:
 
-        cd <repo>/subagents && adk web        # then pick "parity_app"
+    cd <repo>/subagents && adk web        # then pick "parity_app"
 
-    Standalone also starts a FRESH session. In the pipeline every stage shares
-    one, so parity runs last and inherits every earlier event — which is how a
-    single request reached a 202,272-token prompt against a 200,000 ITPM quota.
-
-Either way the target resolves the same: `converted_pyspark_file_path` from
-state when the pipeline set it, else the newest `*_spark.py` in outputs/,
-overridable with PARITY_TARGET_FILE.
+It finds its own target — the newest `*_spark.py` in outputs/, or whatever
+PARITY_TARGET_FILE names — so it needs nothing handed to it. (It will still use
+`converted_pyspark_file_path` if a session happens to carry one, which is what
+lets `build_parity_loop()` be dropped back into a sub_agents list unchanged if
+you ever want the stage back.)
 
 A failing suite is repaired, not just reported: write tests -> run -> fix the
 converted module -> re-test, stopping when every function has a test and the
 suite is green. The fixer edits the converted PySpark only, never the tests —
 a correct test that fails is the signal the conversion is wrong.
 
-An unchanged module skips the whole stage; see `_already_passed` in agent.py.
+An unchanged module skips the whole run; see `_already_passed` in agent.py.
 """
 
 from __future__ import annotations
