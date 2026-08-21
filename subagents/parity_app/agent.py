@@ -1016,6 +1016,18 @@ BATCH_SIZE = 8
 #: more than the opening.
 MAX_INJECTED_BODY_CHARS = 3000
 
+#: Truncation is only safe when the agent can FETCH the rest. With
+#: include_contents="none" it cannot: the truncation marker tells it to call
+#: read_converted_functions_tool, the call succeeds, and the response is not
+#: visible on the next model call — so the agent stops mid-turn with a batch it
+#: can neither finish nor abandon. That is the stall seen at event #4.
+#:
+#: With history off the bodies are therefore injected whole. The cost is
+#: bounded by BATCH_CHAR_BUDGET either way, and a prompt of ~8,500 tokens has
+#: room the pipeline never did.
+_CAN_FETCH = PARITY_INCLUDE_CONTENTS != "none"
+_BODY_CAP = MAX_INJECTED_BODY_CHARS if _CAN_FETCH else 10 ** 9
+
 #: Ceiling on the SOURCE characters injected per iteration; the batch is capped
 #: by whichever limit binds first.
 #:
@@ -1112,11 +1124,11 @@ def _batch_bodies(script_path: str, names: list[str]) -> dict:
         if n.name not in wanted:
             continue
         body = ast.get_source_segment(src, n) or ast.unparse(n)
-        if len(body) > MAX_INJECTED_BODY_CHARS:
+        if len(body) > _BODY_CAP:
             # Cut at a line boundary so the fragment is still readable code,
             # and say plainly that it is a fragment — a body that merely stops
             # mid-statement invites assertions about logic that was cut off.
-            head = body[:MAX_INJECTED_BODY_CHARS].rsplit("\n", 1)[0]
+            head = body[:_BODY_CAP].rsplit("\n", 1)[0]
             body = (
                 head
                 + f"\n    # ... TRUNCATED ({len(body):,} chars total). This is the "
@@ -1229,12 +1241,21 @@ def _instruction_for(include_contents: str, base: str) -> str:
     ~176,000 of inherited session history it replaces.
     """
     if include_contents != "none":
-        return base
+        return (
+            base
+            + "\n\n        Call read_rules_tool() before your first batch, and any "
+              "time you are\n        unsure: it holds the coverage rule, the Spark "
+              "fixture requirements, the\n        naming rule, and the rule about never "
+              "weakening a test. Those rules\n        are binding — not having read them "
+              "is not an excuse for breaking them.\n\n        - read_rules_tool(): the "
+              "workflow and rules in full.\n"
+        )
     return (
         base
-        + "\n\n        You do NOT see earlier turns, so the rules are inlined below "
-          "rather than\n        fetched — read_rules_tool() would hand you a response you "
-          "may not still\n        have when you write. These rules are binding.\n\n"
+        + "\n\n        You do NOT see earlier turns. Everything you need is in this "
+          "prompt: the\n        batch, the complete source of every function in it, and "
+          "the rules below.\n        Nothing can be fetched, and nothing carries over. "
+          "These rules are binding.\n\n"
         + "        <rules>\n"
         + "\n".join("        " + line for line in _rules_text().splitlines())
         + "\n        </rules>\n"
@@ -1267,9 +1288,10 @@ def build_parity_agent(name: str = "parity_test_case_validation_agent"):
         {current_batch}
         </current_batch>
 
-        `current_batch.source` already holds the REAL body of every function in
-        the batch — you do not need a tool call to see them. Assert against what
-        that code actually does; never guess behaviour from a name.
+        `current_batch.source` holds the COMPLETE body of every function in the
+        batch. Assert against what that code actually does; never guess
+        behaviour from a name. There is nothing more to fetch — everything you
+        need to write this batch is already in this prompt.
 
         Write exactly one `test_<function_name>` for each function in the batch,
         submit them with add_pytest_tests_tool, then follow
@@ -1279,28 +1301,28 @@ def build_parity_agent(name: str = "parity_test_case_validation_agent"):
         Assume nothing carries over between turns. Everything you need is in
         this prompt, recomputed from what is on disk right now.
 
-        Call read_rules_tool() before your first batch, and any time you are
-        unsure: it holds the counting rule, the Spark fixture requirements, the
-        naming rule, and the rule about never weakening a test. Those rules are
-        binding — not reading them is not an excuse for breaking them.
-
         Tools:
-        - read_rules_tool(): the workflow and rules in full.
-        - read_converted_functions_tool(names): bodies of functions OUTSIDE the
-          batch, if a test genuinely needs one. The batch's own bodies are
-          already in <current_batch>.
         - add_pytest_tests_tool(tests_code): submit the batch; merges by name, so
           never resend a test that is already in the file.
         - run_pytest_tool(): run on Databricks; returns a structured result.
-        - read_converted_index_tool(): signatures, if <current_batch> is not enough.
         """),
-        tools=[
-            read_converted_index_tool,
-            read_converted_functions_tool,
-            add_pytest_tests_tool,
-            read_rules_tool,
-            run_pytest_tool,
-        ],
+        # A tool the model must READ FROM is unusable when its response will
+        # not be visible on the next model call. add_pytest_tests_tool and
+        # run_pytest_tool are fine — they act, and the verdict is recomputed in
+        # the callback regardless of what the agent saw. The read tools are
+        # withdrawn rather than left as a trap: with history off, calling one
+        # ends the turn with nothing gained.
+        tools=(
+            [
+                read_converted_index_tool,
+                read_converted_functions_tool,
+                add_pytest_tests_tool,
+                read_rules_tool,
+                run_pytest_tool,
+            ]
+            if _CAN_FETCH else
+            [add_pytest_tests_tool, run_pytest_tool]
+        ),
         include_contents=PARITY_INCLUDE_CONTENTS,
         mode="task",
         output_key="test_generation_output",

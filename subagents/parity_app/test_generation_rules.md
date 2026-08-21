@@ -1,7 +1,8 @@
 # Parity test generation — rules and workflow
 
-Everything here is static. It is fetched with `read_rules_tool()` when you need
-it, instead of riding in the prompt on every iteration.
+These rules are binding. They reach you one of two ways depending on how the
+agent is configured — inlined into the prompt, or fetched on demand — so do not
+read anything into which one you are looking at.
 
 ## Coverage
 
