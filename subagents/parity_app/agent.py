@@ -1180,7 +1180,9 @@ def _structured_pytest_result(stdout: str, stderr: str, returncode: "int | None"
     """
     failed: list[dict] = []
     for line in (stdout or "").splitlines():
-        stripped = line.strip()
+        # Tolerate both shapes: raw pytest ("FAILED x::y - err") and the
+        # summarised form, which bullets each failure as "  - FAILED ...".
+        stripped = line.strip().lstrip("-").strip()
         for marker in ("FAILED ", "ERROR "):
             if not stripped.startswith(marker):
                 continue
@@ -1216,11 +1218,20 @@ def run_pytest_tool(context: ToolContext) -> dict:
             "error": "No pyspark_pytest.py found. Call add_pytest_tests_tool first.",
         }
 
-    returncode = _run_pytest_suite(context.state)
-    stdout = context.state.get("pytest_last_stdout", "") or ""
-    stderr = context.state.get("pytest_last_stderr", "") or ""
+    _run_pytest_suite(context.state)
 
-    return _structured_pytest_result(stdout, stderr, returncode)
+    # Returned, not re-derived. _run_pytest_suite already parsed the RAW pytest
+    # output into pytest_last_result; re-parsing the SUMMARY it also stored
+    # silently lost every failure, because _summarize_pytest indents each line
+    # as "  - FAILED ..." and the parser looks for a line starting "FAILED ".
+    # Stripping leaves "- FAILED ...", which never matches — so the tool
+    # reported failed_tests: [] on a suite that was failing.
+    return context.state.get("pytest_last_result") or {
+        "passed": False,
+        "failed_tests": [],
+        "failed_count": 0,
+        "run_error": "pytest produced no result",
+    }
 
 
 
