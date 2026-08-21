@@ -331,10 +331,12 @@ def load_functions_to_test(callback_context: CallbackContext):
         # the file on disk. So it just says what to do next.
         "is_final_batch": remaining == 0,
         "next_step": (
-            "This is the LAST batch. Submit it, then call run_pytest_tool() once."
+            "This is the LAST batch. Submit it and STOP — the suite is run for "
+            "you as soon as every function has a test, and its result is "
+            "handled without you."
             if remaining == 0 else
-            f"After submitting, STOP. {remaining} function(s) remain and you will "
-            f"be re-invoked with the next batch. Do not run the suite yet."
+            f"Submit this batch and STOP. {remaining} function(s) remain and you "
+            f"will be re-invoked with the next one."
         ),
     }
 
@@ -1204,37 +1206,6 @@ def _structured_pytest_result(stdout: str, stderr: str, returncode: "int | None"
     return result
 
 
-def run_pytest_tool(context: ToolContext) -> dict:
-    """Run the generated test suite on Databricks and capture the result.
-
-    Uploads a driver notebook carrying both pyspark_pytest.py and the converted
-    PySpark module it imports, runs it on serverless compute, and returns
-    pytest's returncode plus a condensed summary of the failing tests.
-    """
-    path = _pytest_path()
-    if not path.exists():
-        return {
-            "success": False,
-            "error": "No pyspark_pytest.py found. Call add_pytest_tests_tool first.",
-        }
-
-    _run_pytest_suite(context.state)
-
-    # Returned, not re-derived. _run_pytest_suite already parsed the RAW pytest
-    # output into pytest_last_result; re-parsing the SUMMARY it also stored
-    # silently lost every failure, because _summarize_pytest indents each line
-    # as "  - FAILED ..." and the parser looks for a line starting "FAILED ".
-    # Stripping leaves "- FAILED ...", which never matches — so the tool
-    # reported failed_tests: [] on a suite that was failing.
-    return context.state.get("pytest_last_result") or {
-        "passed": False,
-        "failed_tests": [],
-        "failed_count": 0,
-        "run_error": "pytest produced no result",
-    }
-
-
-
 def _instruction_for(include_contents: str, base: str) -> str:
     """The writer's instruction, with the rules inlined when history is off.
 
@@ -1304,10 +1275,11 @@ def build_parity_agent(name: str = "parity_test_case_validation_agent"):
         behaviour from a name. There is nothing more to fetch — everything you
         need to write this batch is already in this prompt.
 
-        Write exactly one `test_<function_name>` for each function in the batch,
-        submit them with add_pytest_tests_tool, then follow
-        `current_batch.next_step`. Do not work out what is left or whether the
-        suite is complete — that is decided for you and is already in the batch.
+        Write one `test_<function_name>` for each function in the batch, submit
+        them with add_pytest_tests_tool, then STOP. Do not work out what is
+        left, whether the suite is complete, or whether it passes — the suite is
+        run for you once every function has a test, and the result is handled
+        without you. Your only job is writing this batch.
 
         Assume nothing carries over between turns. Everything you need is in
         this prompt, recomputed from what is on disk right now.
@@ -1315,7 +1287,6 @@ def build_parity_agent(name: str = "parity_test_case_validation_agent"):
         Tools:
         - add_pytest_tests_tool(tests_code): submit the batch; merges by name, so
           never resend a test that is already in the file.
-        - run_pytest_tool(): run on Databricks; returns a structured result.
         """),
         # A tool the model must READ FROM is unusable when its response will
         # not be visible on the next model call. add_pytest_tests_tool and
@@ -1323,16 +1294,24 @@ def build_parity_agent(name: str = "parity_test_case_validation_agent"):
         # the callback regardless of what the agent saw. The read tools are
         # withdrawn rather than left as a trap: with history off, calling one
         # ends the turn with nothing gained.
+        # run_pytest_tool is NOT here. check_test_case_status runs the suite
+        # itself the moment coverage is complete, so a writer that also ran it
+        # meant two Databricks runs per iteration for one answer — and with
+        # history off the writer could not see its own result anyway, so it
+        # reported "did not produce any result" on a run that had worked.
+        #
+        # The writer's job is to write tests. Running them, judging them and
+        # deciding what happens next all belong to the callback, which is the
+        # only place that sees the finished file.
         tools=(
             [
                 read_converted_index_tool,
                 read_converted_functions_tool,
                 add_pytest_tests_tool,
                 read_rules_tool,
-                run_pytest_tool,
             ]
             if _CAN_FETCH else
-            [add_pytest_tests_tool, run_pytest_tool]
+            [add_pytest_tests_tool]
         ),
         include_contents=PARITY_INCLUDE_CONTENTS,
         mode="task",
