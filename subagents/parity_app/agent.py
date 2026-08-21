@@ -592,6 +592,33 @@ def _pytest_driver_source(module_name: str, module_src: str, test_src: str) -> s
     return header + _PYTEST_DRIVER_BODY
 
 
+def _record_run_failure(state, reason: str) -> None:
+    """Record a run that never produced a pytest result, and say why.
+
+    Every early exit from _run_pytest_suite used to set pytest_last_returncode
+    and pytest_last_stderr but NOT pytest_last_result, so the structured result
+    kept its seeded "has not run yet" value. That made a real failure invisible
+    twice over: check_test_case_status saw tests_pass False and did not
+    escalate, and seed_parity_fixer saw no failing tests and no run_error so it
+    skipped — the loop then handed the writer an empty batch over and over
+    until it ran out of iterations, with the actual reason sitting unread in
+    pytest_last_stderr.
+
+    A run that could not happen is reported as run_error, which is the same
+    shape a broken cluster run produces and which the fixer already knows how
+    to refuse to guess at.
+    """
+    state["pytest_last_returncode"] = None
+    state["pytest_last_stdout"] = ""
+    state["pytest_last_stderr"] = _cap(reason, 1500)
+    state["pytest_last_result"] = {
+        "passed": False,
+        "failed_tests": [],
+        "failed_count": 0,
+        "run_error": _cap(reason, 600),
+    }
+
+
 def _run_pytest_suite(state) -> "int | None":
     """Run pyspark_pytest.py on Databricks and record the result in state.
 
@@ -616,10 +643,9 @@ def _run_pytest_suite(state) -> "int | None":
 
     module_path = state.get("converted_pyspark_file_path")
     if not module_path or not os.path.isfile(str(module_path)):
-        state["pytest_last_returncode"] = None
-        state["pytest_last_stdout"] = ""
-        state["pytest_last_stderr"] = (
-            f"Converted PySpark module not found at {module_path!r} — cannot run the suite."
+        _record_run_failure(
+            state,
+            f"Converted PySpark module not found at {module_path!r} — cannot run the suite.",
         )
         return None
 
@@ -695,10 +721,9 @@ def _run_pytest_suite(state) -> "int | None":
                 break
 
             if time.time() - start > timeout:
-                state["pytest_last_returncode"] = None
-                state["pytest_last_stdout"] = ""
-                state["pytest_last_stderr"] = (
-                    f"pytest run timed out after {timeout} seconds (run_id {run_id})."
+                _record_run_failure(
+                    state,
+                    f"pytest run timed out after {timeout} seconds (run_id {run_id}).",
                 )
                 return None
 
@@ -714,12 +739,10 @@ def _run_pytest_suite(state) -> "int | None":
 
         result = (output.get("notebook_output") or {}).get("result")
         if not result:
-            state["pytest_last_returncode"] = None
-            state["pytest_last_stdout"] = ""
-            state["pytest_last_stderr"] = _cap(
+            _record_run_failure(
+                state,
                 "The pytest driver notebook did not return a result. "
                 f"Databricks error: {output.get('error') or 'unknown'}",
-                1500,
             )
             return None
 
@@ -736,10 +759,8 @@ def _run_pytest_suite(state) -> "int | None":
         return returncode
 
     except Exception as exc:
-        state["pytest_last_returncode"] = None
-        state["pytest_last_stdout"] = ""
-        state["pytest_last_stderr"] = (
-            f"Databricks pytest run failed: {type(exc).__name__}: {exc}"
+        _record_run_failure(
+            state, f"Databricks pytest run failed: {type(exc).__name__}: {exc}"
         )
         return None
 
@@ -812,18 +833,38 @@ def check_test_case_status(callback_context: CallbackContext) -> None:
         state["parity_validation_passed"] = False
         _write_result(state, "incomplete", target_names, missing)
     else:
-        state["parity_test_status"] = {
-            "status": "failed",
-            "missing_functions": [],
-            "message": (
-                "All functions have tests, but the suite is failing. Fix the "
-                "converted PySpark code against the pytest errors below — fix "
-                "the code, never weaken a test."
-            ),
-            "pytest_output": state.get("pytest_last_stdout") or "",
-        }
-        state["parity_validation_passed"] = False
-        _write_result(state, "failed", target_names, [])
+        result = state.get("pytest_last_result") or {}
+        run_error = result.get("run_error")
+        if run_error:
+            # The suite could not run at all — a missing module, a timeout, a
+            # Databricks error. Looping cannot help: the writer has nothing left
+            # to write and the fixer has no failing function to repair, so
+            # without this the loop just re-issued an empty batch until
+            # max_iterations. Stop and report the reason instead.
+            state["parity_test_status"] = {
+                "status": "error",
+                "missing_functions": [],
+                "message": (
+                    "The pytest suite could not be run, so parity is unverified. "
+                    f"{run_error}"
+                ),
+            }
+            state["parity_validation_passed"] = False
+            _write_result(state, "error", target_names, [])
+            callback_context.actions.escalate = True
+        else:
+            state["parity_test_status"] = {
+                "status": "failed",
+                "missing_functions": [],
+                "message": (
+                    "All functions have tests, but the suite is failing. Fix the "
+                    "converted PySpark code against the pytest errors below — fix "
+                    "the code, never weaken a test."
+                ),
+                "pytest_output": state.get("pytest_last_stdout") or "",
+            }
+            state["parity_validation_passed"] = False
+            _write_result(state, "failed", target_names, [])
     return None
 
 def read_converted_index_tool(context: ToolContext) -> dict:
