@@ -21,7 +21,17 @@ converted module -> re-test, stopping when every function has a test and the
 suite is green. The fixer edits the converted PySpark only, never the tests —
 a correct test that fails is the signal the conversion is wrong.
 
-An unchanged module skips the whole run; see `_already_passed` in agent.py.
+Results land in three places:
+
+  * `outputs/parity_result.json` — the verdict, written on EVERY run: status,
+    coverage counts, and each failing test with its error.
+  * `outputs/pyspark_pytest.py` — the generated suite itself.
+  * `outputs/parity_last_pass.json` — written only on a green run; it is what
+    lets an unchanged module skip the whole thing next time
+    (see `_already_passed` in agent.py).
+
+Session state carries the same verdict under `parity_test_status` while the run
+is live, but that disappears with the session — the JSON is what survives.
 """
 
 from __future__ import annotations

@@ -1,5 +1,6 @@
 import os
 import ast
+from datetime import datetime, timezone
 import hashlib
 import base64
 import json
@@ -107,6 +108,58 @@ def _already_passed(script_path) -> bool:
         and receipt.get("passed") is True
         and receipt.get("sha256") == digest
     )
+
+
+#: Durable record of the last parity run, pass or fail.
+PARITY_RESULT = "parity_result.json"
+
+
+def _result_path() -> pathlib.Path:
+    return OUTPUTS_DIR / PARITY_RESULT
+
+
+def _write_result(state, status: str, target_names: list, missing: list) -> None:
+    """Record the outcome on disk, on EVERY run rather than only a green one.
+
+    The receipt (`parity_last_pass.json`) exists to let an unchanged module skip
+    the stage, so it is only written when the suite passes — which left a
+    failing run with nothing durable at all. The verdict lived in session state
+    and vanished with the session: nothing to attach to a ticket, nothing to
+    diff against the previous run, nothing for anyone who was not watching the
+    screen.
+
+    Written from the verdict callback, so it always matches the verdict rather
+    than whatever the agent last reported. Never raises: a report we could not
+    write must not fail a run that otherwise succeeded.
+    """
+    result = state.get("pytest_last_result") or {}
+    covered = [n for n in target_names if n not in set(missing)]
+    payload = {
+        "status": status,
+        "passed": status == "success",
+        "module": state.get("converted_pyspark_file_path"),
+        "test_file": str(_pytest_path()),
+        "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "coverage": {
+            "functions_total": len(target_names),
+            "functions_covered": len(covered),
+            "functions_missing": missing,
+        },
+        "suite": {
+            "ran": state.get("pytest_last_returncode") is not None,
+            "returncode": state.get("pytest_last_returncode"),
+            "failed_count": result.get("failed_count", 0),
+            "failed_tests": result.get("failed_tests", []),
+            "run_error": result.get("run_error"),
+        },
+        "message": (state.get("parity_test_status") or {}).get("message", ""),
+    }
+    try:
+        OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+        _result_path().write_text(json.dumps(payload, indent=2, default=str),
+                                  encoding="utf-8")
+    except OSError:
+        pass
 
 
 def _write_receipt(script_path, test_count: int) -> None:
@@ -644,6 +697,7 @@ def check_test_case_status(callback_context: CallbackContext) -> None:
         }
         state["parity_validation_passed"] = True
         _write_receipt(state.get("converted_pyspark_file_path"), len(target_names))
+        _write_result(state, "success", target_names, [])
         callback_context.actions.escalate = True
     elif not all_present:
         state["parity_test_status"] = {
@@ -655,6 +709,7 @@ def check_test_case_status(callback_context: CallbackContext) -> None:
             ),
         }
         state["parity_validation_passed"] = False
+        _write_result(state, "incomplete", target_names, missing)
     else:
         state["parity_test_status"] = {
             "status": "failed",
@@ -667,6 +722,7 @@ def check_test_case_status(callback_context: CallbackContext) -> None:
             "pytest_output": state.get("pytest_last_stdout") or "",
         }
         state["parity_validation_passed"] = False
+        _write_result(state, "failed", target_names, [])
     return None
 
 def read_converted_index_tool(context: ToolContext) -> dict:
