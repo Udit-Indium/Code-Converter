@@ -851,7 +851,34 @@ def _next_batch_source(state) -> str:
         except (OSError, SyntaxError):
             converted_names = set()
     missing = [name for name in source_names if name not in converted_names]
+
+    # Constants are resolved BEFORE the nothing-left check, not after it.
+    # They used to be appended at the end of this function, which made them
+    # unreachable in exactly the case that matters: once every function is
+    # converted this returned "(nothing left to convert)" and stopped, so a
+    # module missing its constants was told there was nothing to do — every
+    # iteration, until the loop ran out. The case-fact checker meanwhile kept
+    # failing the run for those same constants, because a constant mismatch is
+    # part of all_match. Functions finished, constants never started.
+    pending_constants = _missing_constants(state)
+    constants_block = ""
+    if pending_constants:
+        lines = "\n".join(f"{name} = {value!r}" for name, value in pending_constants.items())
+        constants_block = (
+            "# MODULE-LEVEL CONSTANTS still missing from the converted file.\n"
+            "# Emit these VERBATIM at module level, exactly once, with these\n"
+            "# exact values. They are not optional and cannot be derived from\n"
+            "# anything else you can see.\n"
+            f"{lines}\n\n"
+        )
+
     if not missing:
+        if constants_block:
+            return (
+                constants_block
+                + "# Every function is already converted. Add ONLY the constants above,\n"
+                  "# with add_converted_functions_tool, then stop."
+            )
         return "(nothing left to convert)"
     src = _source_text()
     if not src.strip():
@@ -889,18 +916,7 @@ def _next_batch_source(state) -> str:
     # Prepend any constants still absent from the converted file. Injected
     # rather than left to a tool call, because the model has to know the value
     # to write it and cannot infer 0.908 from the name USD_2_EUR.
-    pending = _missing_constants(state)
-    if pending:
-        block = "\n".join(f"{name} = {value!r}" for name, value in pending.items())
-        out = (
-            "# MODULE-LEVEL CONSTANTS still missing from the converted file.\n"
-            "# Emit these VERBATIM at module level in this batch, exactly once,\n"
-            "# with these exact values. They are not optional and cannot be\n"
-            "# derived from anything else you can see.\n"
-            f"{block}\n\n"
-            + out
-        )
-    return out
+    return constants_block + out
 
 
 def _compact_case_fact_status(state) -> dict:
