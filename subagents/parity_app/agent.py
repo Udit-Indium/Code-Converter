@@ -525,7 +525,13 @@ def _needed_packages(module_src: str, test_src: str) -> list[str]:
     return sorted(found | set(EXTRA_PIP_PACKAGES))
 
 
-_PYTEST_DRIVER_BODY = '''
+#: RAW string on purpose. This is Python source for a notebook, nested inside
+#: Python source here — so an escape written in this block is consumed by THIS
+#: file's parser and never reaches the driver. A "\n" added to build a log line
+#: became a real newline inside the driver's own string literal, splitting it
+#: across two lines: "Databricks error: Syntax error at line 49". The r-prefix
+#: makes what is written here what the cluster runs.
+_PYTEST_DRIVER_BODY = r'''
 import base64, contextlib, io, json, os, sys
 
 _DIR = "/tmp/parity_suite"
@@ -657,6 +663,26 @@ def _run_pytest_suite(state) -> "int | None":
         module_path.read_text(encoding="utf-8"),
         path.read_text(encoding="utf-8"),
     )
+
+    # Compile the driver before shipping it. It is Python source assembled
+    # inside Python source, so an escape written in the template can be consumed
+    # by this file's parser and never reach the cluster — which is how a "\n"
+    # ended up as a real newline inside a string literal and came back as the
+    # opaque "Databricks error: Syntax error at line 49" after a full round
+    # trip. Checking here names the line locally, in a second, before the
+    # upload.
+    try:
+        compile(driver, "<pytest_driver>", "exec")
+    except SyntaxError as exc:
+        broken = (driver.splitlines()[exc.lineno - 1].strip()
+                  if exc.lineno and exc.lineno <= len(driver.splitlines()) else "")
+        _record_run_failure(
+            state,
+            f"The generated pytest driver does not compile — line {exc.lineno}: "
+            f"{exc.msg}. Offending line: {broken!r}. This is a bug in the driver "
+            f"template, not in the converted code or the tests.",
+        )
+        return None
 
     file_name = f"parity_{uuid.uuid4().hex}.py"
     workspace_path = f"/Workspace/Users/{USER}@shell.com/Drafts/{file_name}"
