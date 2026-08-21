@@ -976,6 +976,60 @@ def seed_fact_status(callback_context: CallbackContext) -> None:
     return None
 
 
+def _skip_agent_response(message: str):
+    """Content that makes ADK skip the agent, or None if it cannot.
+
+    Returning `types.Content` from a before-agent callback is ADK's documented
+    way to bypass the model call. Wrapped because the import path has moved
+    between versions and a skip optimisation must never be what breaks a run:
+    on any failure this returns None, the callback falls through, and the agent
+    runs exactly as it did before.
+    """
+    try:
+        from google.genai import types
+
+        return types.Content(role="model", parts=[types.Part(text=message)])
+    except Exception:
+        return None
+
+
+def seed_parity_fixer(callback_context: CallbackContext):
+    """Prepare the parity fixer, and skip it when there is nothing to fix.
+
+    The parity loop is [writer, fixer], but the writer only runs the suite on
+    its LAST batch — every earlier batch leaves no pytest result at all. The
+    fixer was still invoked each time, read an empty result, announced that
+    nothing was failing and stopped: a full model turn, and a full prompt, to
+    say "no work". On a three-batch module that is two wasted turns before the
+    suite has run once.
+
+    Skipping is safe precisely because there is nothing to do: no failing test
+    means no function to repair, which is the same conclusion the agent reached
+    on its own, only without paying for it.
+    """
+    state = callback_context.state
+    if state.get("pyspark_conventions"):
+        state["pyspark_conventions"] = ""
+
+    result = state.get("pytest_last_result")
+    if result is None:
+        result = {
+            "passed": None,
+            "failed_tests": [],
+            "failed_count": 0,
+            "note": "The suite has not run yet — there is nothing to fix.",
+        }
+        state["pytest_last_result"] = result
+
+    failing = (result or {}).get("failed_tests") or []
+    broke = (result or {}).get("run_error")
+    if not failing and not broke:
+        return _skip_agent_response(
+            "No failing tests to repair — the suite has not run yet, or it passed."
+        )
+    return None
+
+
 def seed_conventions(callback_context: CallbackContext) -> None:
     """Keep fixer state compact; conventions are supplied by the SkillToolset."""
     state = callback_context.state
@@ -1518,5 +1572,5 @@ def build_code_fixer_agent(name: str = "code_fixer_agent"):
 
         mode="task",
         output_key="code_fixer_output",
-        before_agent_callback=seed_conventions,
+        before_agent_callback=seed_parity_fixer,
     )

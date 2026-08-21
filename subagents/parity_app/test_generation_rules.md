@@ -3,21 +3,21 @@
 Everything here is static. It is fetched with `read_rules_tool()` when you need
 it, instead of riding in the prompt on every iteration.
 
-## The one rule about counts
+## Coverage
 
-**Exactly one test per function — no more, no fewer.**
+**Every function in your batch must have a `test_<function_name>`.** A missing
+test is a failure.
 
-- Every function in your current batch gets a `test_<function_name>`.
-- Do **not** add a second test for a function you have already covered. No
-  separate happy-path / error-case / edge-case tests, no `test_<name>_empty`,
-  `test_<name>_raises`, `test_<name>_nulls`.
+There is no ceiling. Add a second test for a function when the behaviour
+genuinely needs it — an error path, an empty input, a missing file — and define
+whatever module-level helpers and fixtures the tests need to run. Helpers do not
+count as tests; only `test_*` functions do.
 
-This is a *parity* suite. Each test answers one question — *does the converted
-function behave like the source function?* — and that is a single comparison.
-Extra cases are unit testing, which is a different job. Every extra test costs
-output tokens once and prompt tokens on every turn afterwards.
-
-If N functions are listed, the finished file has N tests.
+Keep it proportionate. This is a *parity* suite: the question is whether the
+converted function behaves like the source function, so most functions need one
+comparison and nothing more. Extra tests are worth writing when they pin down
+real behaviour, not to be thorough for its own sake — each one costs output
+tokens now and prompt tokens on every turn after.
 
 ## Workflow
 

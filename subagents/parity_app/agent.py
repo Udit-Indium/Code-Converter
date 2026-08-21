@@ -843,14 +843,6 @@ def add_pytest_tests_tool(context: ToolContext, tests_code: str) -> dict:
     # `test_x_raises` all satisfy `x` and the extras pass unnoticed. Reported
     # here instead, because unrequested extras are pure cost — they are written
     # once and then re-sent in the prompt on every remaining turn.
-    if targets and len(total) > len(targets):
-        result["too_many_tests"] = True
-        result["expected_test_count"] = len(targets)
-        result["action_required"] = (
-            f"{len(total)} tests for {len(targets)} functions. This is a parity "
-            f"suite: exactly one test per function. Do not add more; if a "
-            f"function has several tests, that is over-testing, not coverage."
-        )
     return result
 
 
