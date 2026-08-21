@@ -386,6 +386,7 @@ def _missing_functions(target_names: list[str], test_functions: list[str]) -> li
     """
     by_specificity = sorted(set(target_names), key=len, reverse=True)
     covered: set[str] = set()
+    unmatched: list[str] = []
 
     for test_name in test_functions:
         if not test_name.startswith("test_"):
@@ -393,6 +394,28 @@ def _missing_functions(target_names: list[str], test_functions: list[str]) -> li
         stem = test_name[len("test_"):]
         for fn in by_specificity:
             if stem == fn or stem.startswith(f"{fn}_"):
+                covered.add(fn)
+                break
+        else:
+            unmatched.append(stem)
+
+    # Second pass, ignoring a leading underscore on the FUNCTION name. A private
+    # helper `_parse_catman_sheet` is naturally tested as `test_parse_catman_sheet`
+    # -- writing `test__parse_catman_sheet` looks like a typo, so nobody does it.
+    # Exact matching left every such helper permanently uncovered, which meant
+    # all_present never became true, the suite never ran, and the helper came
+    # back in the next batch forever: the writer rewrote the same tests until
+    # the loop ran out of iterations.
+    #
+    # Deliberately a SECOND pass, not a looser first one: where both `foo` and
+    # `_foo` exist, the exact match claims its test before the relaxed rule can
+    # take it, and a target already covered is never claimed twice.
+    for stem in unmatched:
+        for fn in by_specificity:
+            if fn in covered:
+                continue
+            bare = fn.lstrip("_")
+            if bare and (stem == bare or stem.startswith(f"{bare}_")):
                 covered.add(fn)
                 break
 

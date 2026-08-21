@@ -57,7 +57,10 @@ tokens now and prompt tokens on every turn after.
 ## Naming
 
 A suffixed test name **counts**: `test_load_orders_handles_nulls` covers
-`load_orders`. Never rename a test to satisfy the coverage rule — if
+`load_orders`.
+
+A private helper may be tested either way — `_parse_sheet` is covered by
+`test_parse_sheet` or `test__parse_sheet`. Use whichever reads better. Never rename a test to satisfy the coverage rule — if
 `get_missing_tests()` still lists a function, its test is genuinely absent, not
 misnamed.
 
