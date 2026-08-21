@@ -438,7 +438,7 @@ def _summarize_pytest(stdout: str, stderr: str, returncode: "int | None") -> str
     flood the LLM context. We keep just: the counts line, and one line per
     failing/erroring test (its node id + the first line of the error, capped).
     """
-    lines = (stdout or "").splitlines()
+    lines = _strip_ansi(stdout).splitlines()
     counts = ""
     for l in reversed(lines):
         s = l.strip()
@@ -462,7 +462,7 @@ def _summarize_pytest(stdout: str, stderr: str, returncode: "int | None") -> str
         parts.extend(f"  - {f}" for f in failures)
     else:
         parts.append("No per-test summary parsed; tail of stderr:")
-        parts.append(_cap(stderr or stdout, 1500))
+        parts.append(_cap(_strip_ansi(stderr or stdout), 1500))
 
     return "\n".join(parts)[:_MAX_SUMMARY_CHARS]
 
@@ -571,7 +571,8 @@ _buf = io.StringIO()
 with contextlib.redirect_stdout(_buf), contextlib.redirect_stderr(_buf):
     # -q quiet, --tb=line one-line tracebacks, -rfE short summary of failed +
     # errored tests. Together this keeps output tiny.
-    _rc = pytest.main(["pyspark_pytest.py", "-q", "--tb=line", "-rfE", "-p", "no:cacheprovider"])
+    _rc = pytest.main(["pyspark_pytest.py", "-q", "--tb=line", "-rfE",
+                       "--color=no", "-p", "no:cacheprovider"])
 
 _out = _buf.getvalue()[-40000:]
 if _PIP_LOG:
@@ -1263,6 +1264,26 @@ def read_rules_tool(context: ToolContext) -> dict:
     return {"rules": _rules_text()}
 
 
+#: ANSI colour/style escapes, e.g. "\x1b[31m" before FAILED.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _strip_ansi(text: str) -> str:
+    """Remove terminal colour codes from pytest output.
+
+    pytest colours its output when it thinks a terminal is attached, and on
+    Databricks it does. The summary line then arrives as
+    "\x1b[31mFAILED\x1b[0m pyspark_pytest.py::test_x - ...", which does not
+    start with "FAILED" — so every failure was dropped, the result looked like
+    a run that produced nothing, and a suite with real failures was reported as
+    "The pytest suite could not be run, so parity is unverified."
+
+    --color=no is now passed as well; this is the belt to that braces, because
+    the flag is the driver's to get right and this is the parser's own defence.
+    """
+    return _ANSI_RE.sub("", text or "")
+
+
 def _structured_pytest_result(stdout: str, stderr: str, returncode: "int | None") -> dict:
     """Machine-shaped pytest outcome, in place of prose.
 
@@ -1271,7 +1292,7 @@ def _structured_pytest_result(stdout: str, stderr: str, returncode: "int | None"
     later turns, and cannot be misread the way a truncated traceback can.
     """
     failed: list[dict] = []
-    for line in (stdout or "").splitlines():
+    for line in _strip_ansi(stdout).splitlines():
         # Tolerate both shapes: raw pytest ("FAILED x::y - err") and the
         # summarised form, which bullets each failure as "  - FAILED ...".
         stripped = line.strip().lstrip("-").strip()
@@ -1292,7 +1313,7 @@ def _structured_pytest_result(stdout: str, stderr: str, returncode: "int | None"
         # Nothing parsed as a test failure: the run itself broke (import error,
         # cluster problem). Pass the raw text through rather than reporting an
         # empty failure list, which would read as "nothing wrong".
-        result["run_error"] = _cap(stderr or stdout, 600)
+        result["run_error"] = _cap(_strip_ansi(stderr or stdout), 600)
     return result
 
 
