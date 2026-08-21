@@ -442,6 +442,64 @@ def _summarize_pytest(stdout: str, stderr: str, returncode: "int | None") -> str
     return "\n".join(parts)[:_MAX_SUMMARY_CHARS]
 
 
+#: Packages the CONVERTED code may need that a Databricks serverless runtime
+#: does not ship. Installed into the pytest driver before the module is
+#: imported.
+#:
+#: openpyxl is here because our own conversion rules put it there: hard rule 5
+#: forbids xlwings (it drives desktop Excel and can never run on a cluster) and
+#: directs Excel I/O to pandas + openpyxl. pandas cannot read or write .xlsx
+#: without it, so the converted module imports it and the parity run then died
+#: with ModuleNotFoundError: No module named 'openpyxl' — a rule of ours
+#: creating a dependency nothing installed.
+#:
+#: Only ever install what the module actually imports (see _needed_packages):
+#: a blanket install costs cluster time on every run for packages the code may
+#: never touch.
+RUNTIME_PACKAGE_FOR_IMPORT = {
+    "openpyxl": "openpyxl",
+    "xlrd": "xlrd",
+    "xlsxwriter": "xlsxwriter",
+    "pyarrow": "pyarrow",
+}
+
+#: Extra pip names to force, comma-separated, when the scan is not enough.
+EXTRA_PIP_PACKAGES = [
+    name.strip()
+    for name in os.environ.get("PARITY_PIP_PACKAGES", "").split(",")
+    if name.strip()
+]
+
+
+def _needed_packages(module_src: str, test_src: str) -> list[str]:
+    """Pip names the converted module or its tests import and may lack.
+
+    Scans BOTH: pandas reaches openpyxl through an engine rather than a visible
+    import, so the module may name it only in a `pd.read_excel(...)` call while
+    a test names it directly — and either way the import fails at run time.
+    """
+    found: set[str] = set()
+    for src in (module_src, test_src):
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    pkg = RUNTIME_PACKAGE_FOR_IMPORT.get(alias.name.split(".")[0])
+                    if pkg:
+                        found.add(pkg)
+            elif isinstance(node, ast.ImportFrom):
+                pkg = RUNTIME_PACKAGE_FOR_IMPORT.get((node.module or "").split(".")[0])
+                if pkg:
+                    found.add(pkg)
+    # pandas Excel I/O needs openpyxl even with no direct import of it.
+    if "read_excel" in module_src or "to_excel" in module_src or "ExcelWriter" in module_src:
+        found.add("openpyxl")
+    return sorted(found | set(EXTRA_PIP_PACKAGES))
+
+
 _PYTEST_DRIVER_BODY = '''
 import base64, contextlib, io, json, os, sys
 
@@ -457,6 +515,20 @@ if _DIR not in sys.path:
     sys.path.insert(0, _DIR)
 os.chdir(_DIR)
 
+# Installed before the tests import the module. A failure here is reported
+# rather than raised: the suite may still run if the package was only needed by
+# a path the tests do not reach, and a pip problem should surface as test
+# output, not as an opaque driver crash.
+_PIP_LOG = ""
+if _PIP_PACKAGES:
+    import subprocess
+    _p = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-q", *_PIP_PACKAGES],
+        capture_output=True, text=True,
+    )
+    if _p.returncode != 0:
+        _PIP_LOG = "pip install %s failed: %s" % (_PIP_PACKAGES, (_p.stderr or "")[-500:])
+
 try:
     import pytest
 except ImportError:
@@ -471,6 +543,8 @@ with contextlib.redirect_stdout(_buf), contextlib.redirect_stderr(_buf):
     _rc = pytest.main(["pyspark_pytest.py", "-q", "--tb=line", "-rfE", "-p", "no:cacheprovider"])
 
 _out = _buf.getvalue()[-40000:]
+if _PIP_LOG:
+    _out = _PIP_LOG + "\n" + _out
 dbutils.notebook.exit(json.dumps({"returncode": int(_rc), "stdout": _out}))
 '''
 
@@ -483,10 +557,12 @@ def _pytest_driver_source(module_name: str, module_src: str, test_src: str) -> s
     """
     module_b64 = base64.b64encode(module_src.encode("utf-8")).decode()
     test_b64 = base64.b64encode(test_src.encode("utf-8")).decode()
+    packages = _needed_packages(module_src, test_src)
     header = (
         f"_MODULE_NAME = {module_name!r}\n"
         f"_MODULE_B64 = {module_b64!r}\n"
         f"_TEST_B64 = {test_b64!r}\n"
+        f"_PIP_PACKAGES = {packages!r}\n"
     )
     return header + _PYTEST_DRIVER_BODY
 
